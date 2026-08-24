@@ -8,13 +8,14 @@
     "audit_manifest": "data/audit80/manifest.jsonl"
   },
   "run": {
-    "output_dir": "runs/emotion6_abaw80_vlm",
+    "output_dir": "runs/emotion6_abaw80_vlm_report_conditioned",
     "limit_per_class": 10,
     "grid_size": 4,
     "text_conflict": true,
     "save_all_candidates": false,
     "face_backend": "opencv",
-    "matched_controls": true
+    "matched_controls": true,
+    "report_conditioned": true
   },
   "model": {
     "checkpoint": "checkpoints/resnet18_human_distribution_multitask.pt",
@@ -22,7 +23,7 @@
     "enable_vlm": true,
     "vlm_local_files_only": true,
     "vlm_pair_limit_per_cue": 5,
-    "vlm_cache_dir": "runs/emotion6_abaw80_vlm/vlm_cache"
+    "vlm_cache_dir": "runs/emotion6_abaw80_vlm_report_conditioned/vlm_cache"
   },
   "assets": {
     "face_landmarker": "assets/mediapipe/face_landmarker.task",

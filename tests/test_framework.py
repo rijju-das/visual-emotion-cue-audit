@@ -12,12 +12,13 @@ from affective_twins.datasets import (
 )
 from affective_twins.interventions.color import ColorIntervention
 from affective_twins.interventions.context import ContextIntervention
+from affective_twins.interventions.base import GeneratedTwin
 from affective_twins.interventions.text import TextIntervention
 from affective_twins.metrics import aggregate, bootstrap_mean_ci, js_divergence, pair_metrics
 from affective_twins.models.smolvlm import SmolVLMAdapter
 from affective_twins.models.resnet import SampleDataset
-from affective_twins.runner import _require_sample_images
-from affective_twins.schema import AffectPrediction, AffectSample
+from affective_twins.runner import _report_condition_candidates, _require_sample_images
+from affective_twins.schema import AffectPrediction, AffectSample, CueFamily
 
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -289,3 +290,140 @@ def test_vlm_constrained_choice_parser():
     assert SmolVLMAdapter._choice(" Joy.", ["anger", "joy"]) == "joy"
     assert SmolVLMAdapter._choice(" Color lighting.", ["color_lighting", "scene_context"]) == "color_lighting"
     assert SmolVLMAdapter._choice("unknown", ["low", "high"]) is None
+
+
+def test_same_vlm_grounds_reported_cue_to_candidate_region():
+    class StubVLM(SmolVLMAdapter):
+        def __init__(self):
+            self.model_name = "stub"
+            self.cache_dir = None
+
+        def _ask(self, image, question, max_new_tokens=12):
+            return "option_1"
+
+    class StubLocator:
+        def predict(self, images):
+            return [prediction("joy") for _ in images], None
+
+    source = Image.new("RGB", (20, 20), "orange")
+    first_mask = Image.new("L", (20, 20), 0)
+    second_mask = Image.new("L", (20, 20), 0)
+    ImageDraw.Draw(first_mask).rectangle((0, 0, 7, 19), fill=255)
+    ImageDraw.Draw(second_mask).rectangle((10, 0, 19, 19), fill=255)
+    candidates = [
+        GeneratedTwin(source, first_mask, CueFamily.COLOR, "desaturate", metadata={"panoptic_label": "wall"}),
+        GeneratedTwin(source, second_mask, CueFamily.COLOR, "desaturate", metadata={"panoptic_label": "person"}),
+    ]
+    report = prediction("joy")
+    report.evidence_cue = "color_lighting"
+    report.evidence = "the person's bright clothing"
+    report.raw["parse_status"] = "valid_constrained"
+    selected, status = _report_condition_candidates(
+        StubVLM(), StubLocator(), source, candidates,
+        AffectSample("sample", "unused.jpg", "joy"), report, include_control=True,
+    )
+    assert status == "reported_cue_target"
+    assert selected[0].metadata["selected_candidate_label"].startswith("person (right")
+    assert selected[0].metadata["report_condition_role"] == "reported_cue_target"
+    assert selected[0].metadata["selection_model"] == "same_vlm_report_conditioned_region_selection"
+    assert not selected[0].metadata["is_control"]
+    assert selected[1].metadata["report_condition_role"] == "same_cue_matched_region_control"
+    assert selected[1].metadata["is_control"]
+
+
+def test_vlm_evidence_phrase_is_conditioned_on_its_emotion_and_cue_report():
+    class StubVLM(SmolVLMAdapter):
+        def __init__(self):
+            self.questions = []
+
+        def _ask(self, image, question, max_new_tokens=12):
+            self.questions.append(question)
+            if question.startswith("Classify the apparent emotion"):
+                return "joy"
+            if question.startswith("Choose the strongest visible affect cue"):
+                return "color_lighting"
+            if question.startswith("Classify apparent valence"):
+                return "positive"
+            if question.startswith("Classify apparent arousal"):
+                return "high"
+            if question.startswith("How confident"):
+                return "high"
+            if question.startswith("You classified"):
+                return "bright yellow clothing"
+            return "A person wears bright clothing."
+
+    vlm = StubVLM()
+    report = vlm._predict_one(Image.new("RGB", (20, 20), "yellow"))
+    evidence_question = next(question for question in vlm.questions if question.startswith("You classified"))
+    assert "joy" in evidence_question
+    assert "color_lighting" in evidence_question
+    assert report.evidence == "bright yellow clothing"
+
+
+def test_reported_text_requires_ocr_grounding_in_original():
+    class StubLocator:
+        def predict(self, images):
+            return [prediction("sadness") for _ in images], None
+
+    source = Image.new("RGB", (20, 20), "black")
+    conflict = GeneratedTwin(
+        source,
+        Image.new("L", (20, 20), 255),
+        CueFamily.TEXT,
+        "insert_affect_conflict_text",
+        metadata={"inserted_text": "JOY"},
+    )
+    report = prediction("sadness")
+    report.evidence_cue = "embedded_text"
+    report.evidence = "a sad word"
+    report.raw["parse_status"] = "valid_constrained"
+    selected, status = _report_condition_candidates(
+        None, StubLocator(), source, [conflict],
+        AffectSample("sample", "unused.jpg", "sadness"), report, include_control=True,
+    )
+    assert selected == []
+    assert status == "reported_text_not_groundable_by_ocr"
+
+
+def test_report_conditioned_metrics_compare_reported_target_to_controls():
+    def row(cue, role, vlm_drop, source_drop, is_control=0.0):
+        return {
+            "sample_id": "sample",
+            "cue_family": cue,
+            "operation": "test_edit",
+            "eligible": True,
+            "is_control": is_control,
+            "original_confidence": 0.78,
+            "original_correct": 1.0,
+            "original_folder_correct": float("nan"),
+            "folder_human_agreement": float("nan"),
+            "original_brier": 0.1,
+            "original_nll": 0.2,
+            "original_valence_absolute_error": 0.1,
+            "original_arousal_absolute_error": 0.1,
+            "directional_success": float(source_drop > 0),
+            "source_probability_drop": source_drop,
+            "emotion_js_divergence": 0.05,
+            "va_distance": 0.1,
+            "feature_cosine": 0.95,
+            "entropy_change": 0.04,
+            "report_condition_role": role,
+            "vlm_valid": 1.0,
+            "vlm_cue_grounded": 1.0,
+            "vlm_caption_jaccard": 0.8,
+            "vlm_original_class_probability_drop": vlm_drop,
+            "vlm_original_prediction_flip": float(vlm_drop > 0.1),
+            "vlm_entropy_change": 0.05,
+            "vlm_reported_cue_retained": 0.0,
+        }
+
+    summary = aggregate([
+        row("color_lighting", "reported_cue_target", 0.20, 0.12),
+        row("scene_context", "unreported_cue_comparator", 0.03, 0.01),
+        row("color_lighting", "same_cue_matched_region_control", 0.04, 0.02, is_control=1.0),
+    ])
+    faithfulness = summary["report_conditioned_faithfulness"]
+    assert faithfulness["original_class_probability_drop_mean"] == pytest.approx(0.20)
+    assert faithfulness["reported_minus_unreported_drop_mean"] == pytest.approx(0.17)
+    assert faithfulness["reported_minus_same_cue_control_drop_mean"] == pytest.approx(0.16)
+    assert faithfulness["prediction_flip_rate"] == 1.0

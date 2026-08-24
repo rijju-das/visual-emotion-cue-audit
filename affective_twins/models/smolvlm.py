@@ -19,7 +19,8 @@ CUE_PROMPT = "Choose the strongest visible affect cue. Reply exactly one token f
 VALENCE_PROMPT = "Classify apparent valence. Reply exactly one word: negative, neutral, or positive."
 AROUSAL_PROMPT = "Classify apparent arousal. Reply exactly one word: low, medium, or high."
 CONFIDENCE_PROMPT = "How confident is the visible evidence for the apparent emotion? Reply exactly one word: low, medium, or high."
-EVIDENCE_PROMPT = "Name the visible affect evidence in at most six words. Describe only what is visible; do not infer private internal state."
+EVIDENCE_PROMPT = "You classified the apparent emotion as {emotion} and selected {cue} as the strongest cue. Name the visible evidence for that decision in at most six words. Describe only what is visible; do not infer private internal state."
+CAPTION_PROMPT = "Describe the visible image literally in one short sentence. Do not infer private internal states."
 
 
 class SmolVLMAdapter:
@@ -61,16 +62,25 @@ class SmolVLMAdapter:
         )[0].strip()
 
     def _predict_one(self, image: Image.Image) -> AffectPrediction:
-        responses: Dict[str, str] = {
-            "emotion": self._ask(image, EMOTION_PROMPT),
-            "cue": self._ask(image, CUE_PROMPT),
+        responses: Dict[str, str] = {}
+        responses["emotion"] = self._ask(image, EMOTION_PROMPT)
+        responses["cue"] = self._ask(image, CUE_PROMPT)
+        emotion = self._choice(responses["emotion"], EMOTIONS)
+        cue = self._choice(responses["cue"], ["color_lighting", "facial_action_region", "scene_context", "embedded_text"])
+        responses.update({
             "valence": self._ask(image, VALENCE_PROMPT),
             "arousal": self._ask(image, AROUSAL_PROMPT),
             "confidence": self._ask(image, CONFIDENCE_PROMPT),
-            "evidence": self._ask(image, EVIDENCE_PROMPT, max_new_tokens=16),
-        }
-        emotion = self._choice(responses["emotion"], EMOTIONS)
-        cue = self._choice(responses["cue"], ["color_lighting", "facial_action_region", "scene_context", "embedded_text"])
+            "evidence": self._ask(
+                image,
+                EVIDENCE_PROMPT.format(
+                    emotion=emotion or "an unresolved emotion",
+                    cue=cue or "an unresolved cue",
+                ),
+                max_new_tokens=16,
+            ),
+            "caption": self._ask(image, CAPTION_PROMPT, max_new_tokens=32),
+        })
         valence_word = self._choice(responses["valence"], ["negative", "neutral", "positive"])
         arousal_word = self._choice(responses["arousal"], ["low", "medium", "high"])
         confidence_word = self._choice(responses["confidence"], ["low", "medium", "high"])
@@ -81,17 +91,73 @@ class SmolVLMAdapter:
         probabilities = {label: (1.0 - confidence) / (len(EMOTIONS) - 1) for label in EMOTIONS}
         probabilities[emotion] = confidence
         evidence = re.sub(r"\s+", " ", responses["evidence"]).strip()[:240]
+        caption = re.sub(r"\s+", " ", responses["caption"]).strip()[:320]
         return AffectPrediction(
             emotion_probabilities=probabilities,
             valence={"negative": -0.67, "neutral": 0.0, "positive": 0.67}.get(valence_word, 0.0),
             arousal={"low": -0.50, "medium": 0.0, "high": 0.67}.get(arousal_word, 0.0),
             confidence=confidence,
             predicted_emotion=emotion,
-            caption=evidence,
+            caption=caption,
             evidence=evidence,
             evidence_cue=cue,
-            raw={"responses": responses, "parse_status": "valid_constrained" if valid else "invalid_constrained"},
+            raw={
+                "responses": responses,
+                "parse_status": "valid_constrained" if valid else "invalid_constrained",
+                "probability_source": "ordinal_confidence_proxy",
+            },
         )
+
+    def select_evidence_region(
+        self,
+        image: Image.Image,
+        cue_family: str,
+        candidate_labels: Sequence[str],
+        evidence: str = "",
+        cache_key: str = "",
+    ) -> Dict[str, object]:
+        """Ask the same VLM to ground its reported cue to one candidate region."""
+        labels = [re.sub(r"\s+", " ", str(label)).strip()[:100] for label in candidate_labels]
+        if not labels:
+            return {"index": None, "status": "no_candidates", "response": "", "candidate_labels": []}
+        if len(labels) == 1:
+            return {"index": 0, "status": "single_candidate", "response": "option_0", "candidate_labels": labels}
+        selection_key = "region::{}::{}::{}::{}".format(
+            cache_key,
+            cue_family,
+            evidence,
+            "|".join(labels),
+        )
+        cache_path = self._cache_path(selection_key)
+        if cache_path and cache_path.is_file():
+            return json.loads(cache_path.read_text())
+        options = "\n".join("option_{}: {}".format(index, label) for index, label in enumerate(labels))
+        prompt = (
+            "You reported {cue} as the strongest affect cue with visible evidence: {evidence}.\n"
+            "Which candidate region contains that evidence?\n{options}\n"
+            "Reply with exactly one token from option_0 through option_{last}."
+        ).format(
+            cue=cue_family,
+            evidence=evidence or "unspecified",
+            options=options,
+            last=len(labels) - 1,
+        )
+        response = self._ask(image, prompt, max_new_tokens=8)
+        match = re.search(r"\boption_(\d+)\b", response.strip().lower().replace("-", "_"))
+        index = int(match.group(1)) if match else None
+        if index is not None and not 0 <= index < len(labels):
+            index = None
+        result = {
+            "index": index,
+            "status": "valid_constrained" if index is not None else "invalid_constrained",
+            "response": response,
+            "candidate_labels": labels,
+        }
+        if cache_path:
+            temporary = cache_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(result, indent=2, sort_keys=True))
+            temporary.replace(cache_path)
+        return result
 
     @staticmethod
     def _parse(text: str) -> AffectPrediction:
@@ -153,7 +219,7 @@ class SmolVLMAdapter:
         if not self.cache_dir:
             return None
         digest = hashlib.sha256(
-            (self.model_name + "|constrained-v2|" + key).encode("utf-8")
+            (self.model_name + "|constrained-v3-report-conditioned|" + key).encode("utf-8")
         ).hexdigest()
         return self.cache_dir / "{}.json".format(digest)
 

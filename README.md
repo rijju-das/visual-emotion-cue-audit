@@ -1,15 +1,15 @@
 # Counterfactual Affective Twins
 
-An end-to-end, standalone framework for auditing whether affect models respond to inspectable evidence rather than only matching image-level labels.
+An end-to-end, standalone framework for auditing whether affect models respond to the same inspectable evidence they report using.
 
 The framework creates matched twins that alter one cue family at a time:
 
-- `color_lighting`: two explicit Mask R-CNN twins—luminance-preserving chroma removal over the complete subject (all people merged) and background-only exposure reduction;
-- `facial_action_region`: expanded landmark-contoured eyebrow, eye, or mouth masks with strong blur/pixelation, linked only to annotation-supported AUs;
+- `color_lighting`: luminance-preserving chroma removal over complete Mask2Former/SegFormer semantic entities (person, object, wall, floor, or another surface), with Mask R-CNN subject/background fallback and no rectangular patch intervention;
+- `facial_action_region`: expanded landmark-contoured eyebrow, eye, or mouth masks with strong blur/pixelation; Aff-Wild2 examples additionally retain frame-level AU support and identify inactive-region controls;
 - `scene_context`: panoptic-foreground-preserving background chroma/detail attenuation;
 - `embedded_text`: OCR-localized text removal when text exists, plus contradictory affect-word insertion.
 
-It evaluates categorical emotion, continuous valence–arousal, response direction, probability/distribution change, uncertainty under conflict, content preservation, calibration, caption stability, and cue-evidence grounding. Every twin has a mask and a JSONL manifest entry. Ineligible cues remain in the manifest with a skip reason.
+The primary protocol is report-conditioned. The target VLM first predicts emotion and reports its strongest cue family and visible evidence on the untouched image. The same VLM then grounds that report to a segmented object, facial component, scene context, or OCR text region. Only afterward is the reported evidence manipulated. Unreported cue interventions and nearest-area regions within the reported cue family are retained as explicit comparators. The same target VLM is queried again to measure original-class probability change, prediction flips, entropy, cue retention, and reported-target minus control effects. Every twin has a mask and a JSONL manifest entry; invalid or ungroundable reports remain explicit.
 
 ## Project boundary
 
@@ -37,11 +37,23 @@ export XDG_CACHE_HOME="$PWD/.cache"
 .venv/bin/affective-twins report
 ```
 
-Use `.venv/bin/affective-twins all --config configs/emotion6_abaw80_vlm_server.json` after a checkpoint exists to run generation, evaluation, and reporting together. The GPU workflow is also available in `jobs/full_vlm_gpu.job`.
+Use `.venv/bin/affective-twins all --config configs/emotion6_abaw80_vlm_subject_background_server.json` after a checkpoint exists to run report-conditioned generation, evaluation, and reporting together. The GPU workflow is also available in `jobs/full_vlm_gpu.job`.
 
-The strengthened panoptic-object, AU, and context run uses `configs/emotion6_abaw80_vlm_subject_background_server.json`; `jobs/full_vlm_gpu.job` is already configured for it. It writes to `runs/emotion6_abaw80_vlm_strong_au_context_server/`, leaving earlier runs untouched. Mask2Former COCO panoptic segmentation produces one separately retained mask per object or background surface, with labels such as `person`, `wall-*`, `floor-*`, and a derived `dark-background`; the locator scores these candidates but cannot collapse them into a local patch. All annotation-active AU groups are retained and strongly ablated with expanded landmark masks, while at most one inactive AU region is retained as a control. Context intervention preserves the union of detected panoptic objects exactly and desaturates/blurs only its background complement. SegFormer and Mask R-CNN provide semantic and complete-object fallbacks. Connected superpixels are disabled in the main server configuration. If all object-aware localizers fail, the colour cue is marked ineligible rather than using a grid patch. Mask2Former requires SciPy and downloads an approximately 276 MB checkpoint on its first run.
+The report-conditioned panoptic-object, AU, and context run uses `configs/emotion6_abaw80_vlm_subject_background_server.json`; `jobs/full_vlm_gpu.job` is configured for it. It writes to `runs/emotion6_abaw80_vlm_report_conditioned_server/`, leaving earlier runs untouched. Mask2Former proposes complete objects and background surfaces. When colour is reported, the VLM chooses among those named regions; when facial evidence is reported, it chooses brows, eyes, or mouth. Context has one subject-preserving background candidate. Reported text is eligible only when OCR grounds text already present in the original image; affect-word insertion is retained only as an unreported-cue challenge. A failed region choice is recorded as ineligible rather than replaced by a locator-selected target.
 
-## Outputs
+## Report-conditioned outputs
+
+The new run is written to `runs/emotion6_abaw80_vlm_report_conditioned_server/`:
+
+- `original_reports.jsonl`: the immutable pre-intervention emotion, cue, evidence, caption, and report validity used to condition twin generation;
+- `interventions.jsonl`: the selected reported-cue target, its grounding decision, unreported-cue comparators, matched-region controls, masks, and explicit skips;
+- `predictions.jsonl` and `pair_metrics.csv`: same-model pre/post responses and independent-evaluator diagnostics;
+- `summary.json`: report-conditioned faithfulness, target coverage, prediction flips, and target-minus-control effects;
+- `twins/`, `masks/`, `contact_sheet.png`, `report.md`, and `human_validation_template.csv`: image artefacts and validation materials.
+
+The exact stored report is reused during evaluation; it is not regenerated after the intervention target has been observed.
+
+## Earlier verified outputs
 
 The verified GPU run is in `runs/emotion6_abaw80_vlm_server/`:
 
@@ -56,8 +68,8 @@ After annotators complete the template, summarize it with:
 
 ```bash
 .venv/bin/affective-twins human-summary \
-  --config configs/emotion6_abaw80_vlm_server.json \
-  --annotations runs/emotion6_abaw80_vlm_server/human_validation_template.csv
+  --config configs/emotion6_abaw80_vlm_subject_background_server.json \
+  --annotations runs/emotion6_abaw80_vlm_report_conditioned_server/human_validation_template.csv
 ```
 
 ## Verified earlier GPU audit

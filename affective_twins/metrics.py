@@ -138,4 +138,82 @@ def aggregate(rows: List[Dict]) -> Dict:
         result["vlm_valid_pairs"] = len(vlm_rows)
         attempted = [row for row in eligible if "vlm_valid" in row]
         result["vlm_valid_pair_rate"] = float(len(vlm_rows) / len(attempted)) if attempted else 0.0
+    reported_targets = [
+        row for row in eligible
+        if row.get("report_condition_role") == "reported_cue_target"
+        and row.get("vlm_valid") == 1.0
+    ]
+    unreported_comparators = [
+        row for row in eligible
+        if row.get("report_condition_role") == "unreported_cue_comparator"
+        and row.get("vlm_valid") == 1.0
+    ]
+    if reported_targets:
+        target_drops = [row["vlm_original_class_probability_drop"] for row in reported_targets]
+        target_flips = [row["vlm_original_prediction_flip"] for row in reported_targets]
+        target_entropy = [row["vlm_entropy_change"] for row in reported_targets]
+        comparator_differences = []
+        for target in reported_targets:
+            matched = [
+                row for row in unreported_comparators
+                if row["sample_id"] == target["sample_id"]
+            ]
+            if matched:
+                comparator_differences.append(
+                    target["vlm_original_class_probability_drop"]
+                    - float(np.mean([row["vlm_original_class_probability_drop"] for row in matched]))
+                )
+        same_cue_control_differences = []
+        for target in reported_targets:
+            matched = [
+                row for row in controls
+                if row["sample_id"] == target["sample_id"]
+                and row["cue_family"] == target["cue_family"]
+                and row.get("report_condition_role") == "same_cue_matched_region_control"
+                and row.get("vlm_valid") == 1.0
+            ]
+            if matched:
+                same_cue_control_differences.append(
+                    target["vlm_original_class_probability_drop"]
+                    - float(np.mean([row["vlm_original_class_probability_drop"] for row in matched]))
+                )
+        by_reported_cue = {}
+        for cue in sorted({row["cue_family"] for row in reported_targets}):
+            group = [row for row in reported_targets if row["cue_family"] == cue]
+            drops = [row["vlm_original_class_probability_drop"] for row in group]
+            by_reported_cue[cue] = {
+                "n": len(group),
+                "original_class_probability_drop_mean": float(np.mean(drops)),
+                "original_class_probability_drop_ci95": bootstrap_mean_ci(drops),
+                "prediction_flip_rate": float(np.mean([row["vlm_original_prediction_flip"] for row in group])),
+                "entropy_increase_rate": float(np.mean([row["vlm_entropy_change"] > 0 for row in group])),
+                "reported_cue_retention_rate": float(np.mean([row["vlm_reported_cue_retained"] for row in group])),
+            }
+        result["report_conditioned_faithfulness"] = {
+            "n_reported_cue_targets": len(reported_targets),
+            "n_unreported_cue_comparators": len(unreported_comparators),
+            "original_class_probability_drop_mean": float(np.mean(target_drops)),
+            "original_class_probability_drop_ci95": bootstrap_mean_ci(target_drops),
+            "prediction_flip_rate": float(np.mean(target_flips)),
+            "entropy_increase_rate": float(np.mean(np.asarray(target_entropy) > 0)),
+            "reported_cue_retention_rate": float(np.mean([
+                row["vlm_reported_cue_retained"] for row in reported_targets
+            ])),
+            "reported_minus_unreported_drop_mean": (
+                float(np.mean(comparator_differences)) if comparator_differences else float("nan")
+            ),
+            "reported_minus_unreported_drop_ci95": (
+                bootstrap_mean_ci(comparator_differences) if comparator_differences else [float("nan"), float("nan")]
+            ),
+            "reported_minus_same_cue_control_drop_mean": (
+                float(np.mean(same_cue_control_differences))
+                if same_cue_control_differences else float("nan")
+            ),
+            "reported_minus_same_cue_control_drop_ci95": (
+                bootstrap_mean_ci(same_cue_control_differences)
+                if same_cue_control_differences else [float("nan"), float("nan")]
+            ),
+            "by_reported_cue": by_reported_cue,
+            "probability_note": "SmolVLM probabilities are ordinal confidence proxies; prediction flips are the primary behavioural endpoint.",
+        }
     return result

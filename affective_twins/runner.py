@@ -177,6 +177,146 @@ def _retain_face_regions(
     return result
 
 
+def _candidate_label(candidate) -> str:
+    metadata = candidate.metadata
+    mask = np.asarray(candidate.mask.convert("L")) > 0
+    if mask.any():
+        rows, columns = np.where(mask)
+        horizontal = ["left", "centre", "right"][min(2, int(3 * columns.mean() / mask.shape[1]))]
+        vertical = ["upper", "middle", "lower"][min(2, int(3 * rows.mean() / mask.shape[0]))]
+        position = "{} {}".format(horizontal, vertical)
+    else:
+        position = "unknown position"
+    if metadata.get("panoptic_label"):
+        instance = metadata.get("panoptic_segment_id", metadata.get("proposal_index", ""))
+        suffix = ", segment {}".format(instance) if instance != "" else ""
+        return "{} ({}{})".format(metadata["panoptic_label"], position, suffix)
+    if metadata.get("semantic_label"):
+        return "{} ({})".format(metadata["semantic_label"], position)
+    if metadata.get("au_region"):
+        region = str(metadata["au_region"])
+        component = "brows" if region.startswith("brow") else "eyes" if region.startswith("eye") else "mouth"
+        return "face {} {}".format(metadata.get("face_index", 0), component)
+    if metadata.get("ocr_tokens"):
+        return "detected text: {}".format(" ".join(metadata["ocr_tokens"]))
+    if metadata.get("inserted_text"):
+        return "inserted affect word: {}".format(metadata["inserted_text"])
+    if candidate.cue_family == CueFamily.CONTEXT:
+        return "scene background and surrounding context"
+    return str(metadata.get("subject_type", candidate.operation))
+
+
+def _candidate_area(candidate) -> float:
+    return float(np.asarray(candidate.mask.convert("L"), dtype=np.float32).mean() / 255.0)
+
+
+def _report_condition_candidates(
+    vlm: SmolVLMAdapter,
+    locator: ResNetAffectModel,
+    source: Image.Image,
+    candidates,
+    sample: AffectSample,
+    report: AffectPrediction,
+    include_control: bool,
+):
+    """Choose a reported-cue target or one explicitly unreported comparator."""
+    if not candidates:
+        return [], "no_candidates"
+    candidates = _score_without_discarding(locator, source, candidates, sample.emotion)
+    valid_report = report.raw.get("parse_status") == "valid_constrained"
+    reported_cue = report.evidence_cue if valid_report else ""
+    cue = candidates[0].cue_family.value
+    shared = {
+        "report_conditioned": True,
+        "original_report_valid": valid_report,
+        "original_reported_cue": reported_cue,
+        "original_reported_evidence": report.evidence,
+        "original_reported_emotion": report.predicted_emotion,
+    }
+    if not valid_report or cue != reported_cue:
+        if candidates[0].cue_family == CueFamily.TEXT:
+            eligible = [index for index, candidate in enumerate(candidates) if candidate.operation == "insert_affect_conflict_text"]
+        elif candidates[0].cue_family == CueFamily.FACE:
+            eligible = [
+                index for index, candidate in enumerate(candidates)
+                if candidate.metadata.get("target_active_aus")
+            ] or list(range(len(candidates)))
+        else:
+            eligible = [
+                index for index, candidate in enumerate(candidates)
+                if not candidate.metadata.get("is_control", False)
+            ] or list(range(len(candidates)))
+        selected = eligible[0]
+        candidate = candidates[selected]
+        candidate.metadata.update(shared)
+        candidate.metadata.update({
+            "is_control": False,
+            "report_match": False,
+            "report_condition_role": "unreported_cue_comparator" if valid_report else "invalid_report_comparator",
+            "selection_model": "deterministic_unreported_cue_comparator",
+            "selected_candidate_label": _candidate_label(candidate),
+        })
+        return [candidate], "unreported_cue_comparator"
+
+    if candidates[0].cue_family == CueFamily.TEXT:
+        eligible = [index for index, candidate in enumerate(candidates) if candidate.operation == "remove_detected_text"]
+        if not eligible:
+            return [], "reported_text_not_groundable_by_ocr"
+    else:
+        eligible = list(range(len(candidates)))
+    labels = [_candidate_label(candidates[index]) for index in eligible]
+    selection = vlm.select_evidence_region(
+        source,
+        cue,
+        labels,
+        evidence=report.evidence,
+        cache_key=sample.sample_id,
+    )
+    if selection.get("index") is None:
+        return [], "reported_region_selection_invalid"
+    selected = eligible[int(selection["index"])]
+    target = candidates[selected]
+    target_was_annotation_control = bool(target.metadata.get("is_control", False))
+    target.metadata.update(shared)
+    target.metadata.update({
+        "is_control": False,
+        "report_match": True,
+        "report_condition_role": "reported_cue_target",
+        "selection_model": "same_vlm_report_conditioned_region_selection",
+        "selected_candidate_label": _candidate_label(target),
+        "reported_region_selection_status": selection["status"],
+        "reported_region_selection_response": selection["response"],
+        "reported_region_candidates": selection["candidate_labels"],
+        "au_annotation_consistent": (
+            not target_was_annotation_control
+            if target.metadata.get("au_annotation_backed", False)
+            else None
+        ),
+    })
+    result = [target]
+    if include_control:
+        remaining = [index for index in eligible if index != selected]
+        if remaining:
+            target_area = _candidate_area(target)
+            control_index = min(remaining, key=lambda index: abs(_candidate_area(candidates[index]) - target_area))
+            control = candidates[control_index]
+            control.operation = "matched_report_region_control"
+            control.expected_direction = "control"
+            control.metadata.update(shared)
+            control.metadata.update({
+                "is_control": True,
+                "report_match": False,
+                "report_condition_role": "same_cue_matched_region_control",
+                "selection_model": "mask_area_matched_within_reported_cue_family",
+                "control_for_candidate": selected,
+                "control_matching": "nearest_mask_area_within_reported_cue_family",
+                "target_mask_area_fraction": target_area,
+                "selected_candidate_label": _candidate_label(control),
+            })
+            result.append(control)
+    return result, "reported_cue_target"
+
+
 def generate(config: Dict) -> Dict:
     output_dir = Path(config["run"]["output_dir"])
     checkpoint = Path(config["model"]["checkpoint"])
@@ -185,6 +325,26 @@ def generate(config: Dict) -> Dict:
     samples = load_audit_samples(config)
     _require_sample_images(samples)
     locator = ResNetAffectModel(checkpoint, role="locator")
+    report_conditioned = bool(config["run"].get("report_conditioned", False))
+    report_vlm = None
+    original_reports = {}
+    if report_conditioned:
+        if not config["model"].get("enable_vlm", False):
+            raise ValueError("Report-conditioned generation requires model.enable_vlm=true")
+        report_vlm = SmolVLMAdapter(
+            config["model"]["vlm_model"],
+            local_files_only=bool(config["model"].get("vlm_local_files_only", False)),
+            cache_dir=config["model"].get("vlm_cache_dir"),
+        )
+        source_images = []
+        for sample in samples:
+            with Image.open(sample.image_path) as source_file:
+                source_images.append(source_file.convert("RGB"))
+        predictions = report_vlm.predict(
+            source_images,
+            cache_keys=["original::{}".format(sample.sample_id) for sample in samples],
+        )
+        original_reports = dict(zip((sample.sample_id for sample in samples), predictions))
     generators = [
         ColorIntervention(
             int(config["run"].get("grid_size", 4)),
@@ -220,10 +380,21 @@ def generate(config: Dict) -> Dict:
     intervention_rows = []
     output_dir.mkdir(parents=True, exist_ok=True)
     write_jsonl(output_dir / "samples.jsonl", [sample.to_dict() for sample in samples])
+    if report_conditioned:
+        write_jsonl(output_dir / "original_reports.jsonl", [
+            {
+                "sample_id": sample.sample_id,
+                "reporting_model": config["model"]["vlm_model"],
+                "valid_report": original_reports[sample.sample_id].raw.get("parse_status") == "valid_constrained",
+                **original_reports[sample.sample_id].to_dict(),
+            }
+            for sample in samples
+        ])
     for sample in samples:
         with Image.open(sample.image_path) as source_file:
             source = source_file.convert("RGB")
         context_foreground_mask = None
+        report = original_reports.get(sample.sample_id)
         for generator in generators:
             allowed_cues = sample.metadata.get("allowed_cues")
             if allowed_cues and generator.cue_family.value not in allowed_cues:
@@ -241,7 +412,6 @@ def generate(config: Dict) -> Dict:
             else:
                 candidates = generator.generate(source)
             if generator.cue_family == CueFamily.COLOR:
-                candidates = _score_without_discarding(locator, source, candidates, sample.emotion)
                 foreground_candidates = [
                     candidate for candidate in candidates
                     if candidate.metadata.get("panoptic_is_thing", False)
@@ -254,6 +424,19 @@ def generate(config: Dict) -> Dict:
                         for candidate in foreground_candidates
                     ])
                     context_foreground_mask = Image.fromarray(union.astype(np.uint8) * 255, mode="L")
+            if report_conditioned:
+                candidates, selection_status = _report_condition_candidates(
+                    report_vlm,
+                    locator,
+                    source,
+                    candidates,
+                    sample,
+                    report,
+                    include_control=bool(config["run"].get("matched_controls", False)),
+                )
+            elif generator.cue_family == CueFamily.COLOR:
+                candidates = _score_without_discarding(locator, source, candidates, sample.emotion)
+                selection_status = "legacy_all_candidates"
             elif generator.cue_family == CueFamily.FACE:
                 candidates = _retain_face_regions(
                     locator,
@@ -262,8 +445,15 @@ def generate(config: Dict) -> Dict:
                     sample.emotion,
                     include_control=bool(config["run"].get("matched_controls", False)),
                 )
+                selection_status = "legacy_au_selection"
+            else:
+                selection_status = "legacy_predefined_intervention"
             if not candidates:
-                reason = getattr(generator, "unavailable_reason", "") or "no_eligible_region_detected"
+                reason = (
+                    selection_status
+                    if report_conditioned and selection_status not in {"no_candidates", "unreported_cue_comparator"}
+                    else getattr(generator, "unavailable_reason", "") or "no_eligible_region_detected"
+                )
                 intervention_rows.append(Intervention(
                     intervention_id="{}--{}--skipped".format(sample.sample_id, generator.cue_family.value),
                     sample_id=sample.sample_id,
@@ -273,6 +463,12 @@ def generate(config: Dict) -> Dict:
                     mask_path="",
                     eligible=False,
                     skip_reason=reason,
+                    metadata={
+                        "report_conditioned": report_conditioned,
+                        "original_reported_cue": report.evidence_cue if report else "",
+                        "original_reported_evidence": report.evidence if report else "",
+                        "report_condition_role": "reported_cue_ungroundable" if report and report.evidence_cue == generator.cue_family.value else "cue_unavailable",
+                    },
                 ).to_dict())
                 continue
             for index, candidate in enumerate(candidates):
@@ -304,12 +500,25 @@ def generate(config: Dict) -> Dict:
     )
     skipped = Counter(row["cue_family"] for row in intervention_rows if not row["eligible"])
     provenance = {
-        "framework_version": "0.3.0",
+        "framework_version": "0.4.0",
         "python": sys.version,
         "platform": platform.platform(),
         "torch": torch.__version__,
         "seed": config["seed"],
         "sample_count": len(samples),
+        "report_conditioned": report_conditioned,
+        "valid_original_reports": sum(
+            prediction.raw.get("parse_status") == "valid_constrained"
+            for prediction in original_reports.values()
+        ),
+        "reported_cue_targets": sum(
+            row["eligible"] and row.get("metadata", {}).get("report_condition_role") == "reported_cue_target"
+            for row in intervention_rows
+        ),
+        "unreported_cue_comparators": sum(
+            row["eligible"] and row.get("metadata", {}).get("report_condition_role") == "unreported_cue_comparator"
+            for row in intervention_rows
+        ),
         "eligible_pairs_by_cue": dict(counts),
         "matched_controls_by_cue": dict(control_counts),
         "skipped_samples_by_cue": dict(skipped),
@@ -355,28 +564,56 @@ def evaluate(config: Dict) -> Dict:
 
     if config["model"].get("enable_vlm", False):
         per_cue_limit = int(config["model"].get("vlm_pair_limit_per_cue", 0))
+        report_conditioned = bool(config["run"].get("report_conditioned", False))
         selected_indices = []
         for cue in CueFamily:
             cue_indices = [
                 index for index, row in enumerate(eligible)
-                if row["cue_family"] == cue.value and not row.get("metadata", {}).get("is_control", False)
+                if row["cue_family"] == cue.value
+                and (report_conditioned or not row.get("metadata", {}).get("is_control", False))
             ]
             selected_indices.extend(cue_indices[:per_cue_limit] if per_cue_limit > 0 else cue_indices)
         selected_indices = sorted(set(selected_indices))
         selected_original_ids = list(dict.fromkeys(eligible[index]["sample_id"] for index in selected_indices))
-        selected_original_images = [original_images[original_ids.index(sample_id)] for sample_id in selected_original_ids]
         vlm = SmolVLMAdapter(
             config["model"]["vlm_model"],
             local_files_only=bool(config["model"].get("vlm_local_files_only", False)),
             cache_dir=config["model"].get("vlm_cache_dir"),
         )
-        vlm_original_by_id = dict(zip(
-            selected_original_ids,
-            vlm.predict(
-                selected_original_images,
-                cache_keys=["original::{}".format(sample_id) for sample_id in selected_original_ids],
-            ),
-        ))
+        # Reuse the exact pre-intervention reports that conditioned generation.
+        # This prevents a regenerated answer from silently changing the audit target.
+        vlm_original_by_id = {}
+        original_report_path = output_dir / "original_reports.jsonl"
+        if report_conditioned and original_report_path.is_file():
+            for saved in read_jsonl(original_report_path):
+                if saved["sample_id"] not in selected_original_ids:
+                    continue
+                vlm_original_by_id[saved["sample_id"]] = AffectPrediction(
+                    emotion_probabilities=saved["emotion_probabilities"],
+                    valence=saved["valence"],
+                    arousal=saved["arousal"],
+                    confidence=saved["confidence"],
+                    predicted_emotion=saved["predicted_emotion"],
+                    caption=saved.get("caption", ""),
+                    evidence=saved.get("evidence", ""),
+                    evidence_cue=saved.get("evidence_cue", ""),
+                    raw=saved.get("raw", {}),
+                )
+        missing_original_ids = [
+            sample_id for sample_id in selected_original_ids
+            if sample_id not in vlm_original_by_id
+        ]
+        if missing_original_ids:
+            missing_original_images = [
+                original_images[original_ids.index(sample_id)] for sample_id in missing_original_ids
+            ]
+            vlm_original_by_id.update(dict(zip(
+                missing_original_ids,
+                vlm.predict(
+                    missing_original_images,
+                    cache_keys=["original::{}".format(sample_id) for sample_id in missing_original_ids],
+                ),
+            )))
         selected_twin_predictions = vlm.predict(
             [twin_images[index] for index in selected_indices],
             cache_keys=["twin::{}".format(eligible[index]["intervention_id"]) for index in selected_indices],
@@ -404,6 +641,12 @@ def evaluate(config: Dict) -> Dict:
             "cue_family": intervention["cue_family"],
             "operation": intervention["operation"],
             "is_control": float(intervention.get("metadata", {}).get("is_control", False)),
+            "report_conditioned": float(intervention.get("metadata", {}).get("report_conditioned", False)),
+            "report_match": float(intervention.get("metadata", {}).get("report_match", False)),
+            "report_condition_role": intervention.get("metadata", {}).get("report_condition_role", "legacy_unconditioned"),
+            "original_reported_cue": intervention.get("metadata", {}).get("original_reported_cue", ""),
+            "original_reported_evidence": intervention.get("metadata", {}).get("original_reported_evidence", ""),
+            "selected_candidate_label": intervention.get("metadata", {}).get("selected_candidate_label", ""),
             "au_annotation_backed": float(intervention.get("metadata", {}).get("au_annotation_backed", False)),
             "target_active_aus": ";".join(intervention.get("metadata", {}).get("target_active_aus", [])),
             "eligible": True,
@@ -458,9 +701,18 @@ def evaluate(config: Dict) -> Dict:
                 "vlm_original_evidence_cue": vo.evidence_cue,
                 "vlm_twin_evidence_cue": vt.evidence_cue,
                 "vlm_cue_grounded": float(vt.evidence_cue == intervention["cue_family"]) if vlm_valid else float("nan"),
+                "vlm_original_report_matches_intervention": float(vo.evidence_cue == intervention["cue_family"]) if vlm_valid else float("nan"),
+                "vlm_twin_reports_intervened_cue": float(vt.evidence_cue == intervention["cue_family"]) if vlm_valid else float("nan"),
+                "vlm_reported_cue_retained": float(vt.evidence_cue == vo.evidence_cue) if vlm_valid else float("nan"),
                 "vlm_caption_jaccard": token_jaccard(vo.caption, vt.caption),
                 "vlm_entropy_change": entropy(vt.emotion_probabilities) - entropy(vo.emotion_probabilities),
                 "vlm_source_probability_drop": vo.emotion_probabilities[sample.emotion] - vt.emotion_probabilities[sample.emotion],
+                "vlm_original_class_probability_drop": (
+                    vo.emotion_probabilities[vo.predicted_emotion]
+                    - vt.emotion_probabilities[vo.predicted_emotion]
+                ),
+                "vlm_original_prediction_flip": float(vo.predicted_emotion != vt.predicted_emotion),
+                "vlm_confidence_change": vt.confidence - vo.confidence,
                 "vlm_va_distance": float(math.hypot(vt.valence - vo.valence, vt.arousal - vo.arousal)),
             })
         rows.append(row)
@@ -473,7 +725,23 @@ def evaluate(config: Dict) -> Dict:
         "skips_by_reason": dict(Counter(row["skip_reason"] for row in intervention_rows if not row["eligible"])),
         "vlm_enabled": bool(config["model"].get("enable_vlm", False)),
         "vlm_pairs_evaluated": len(vlm_twins_by_id),
+        "report_conditioned": bool(config["run"].get("report_conditioned", False)),
+        "reported_cue_target_coverage": (
+            len({
+                row["sample_id"] for row in rows
+                if row.get("report_condition_role") == "reported_cue_target"
+            }) / len(samples)
+            if samples else 0.0
+        ),
     })
+    summary["reported_cue_audit_failure_rate"] = 1.0 - summary["reported_cue_target_coverage"]
+    original_report_path = output_dir / "original_reports.jsonl"
+    if original_report_path.is_file():
+        saved_reports = read_jsonl(original_report_path)
+        summary["original_report_valid_rate"] = (
+            float(np.mean([row.get("valid_report", False) for row in saved_reports]))
+            if saved_reports else 0.0
+        )
     write_csv(output_dir / "pair_metrics.csv", rows)
     write_json(output_dir / "summary.json", summary)
     write_jsonl(output_dir / "predictions.jsonl", rows)

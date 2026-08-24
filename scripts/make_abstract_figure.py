@@ -56,15 +56,17 @@ def main() -> None:
             "FACIAL AU REGION",
             "neutralise brow evidence",
             original_face,
-            ROOT / "runs" / "emotion6_full" / "twins" / "facial_action_region" / "sadness-210--facial_action_region--00.png",
+            ROOT / "assets" / "abstract_examples" / "facial-au-twin.png",
             (245, 0, 520, 275),
+            None,
             "#b54545",
         ),
         (
             "COLOUR + LIGHTING",
             "remove local chroma",
             original_scene,
-            ROOT / "runs" / "emotion6_full" / "twins" / "color_lighting" / "disgust-224--color_lighting--00.png",
+            ROOT / "assets" / "abstract_examples" / "color-lighting-twin.png",
+            None,
             None,
             "#c87922",
         ),
@@ -72,7 +74,8 @@ def main() -> None:
             "SCENE CONTEXT",
             "attenuate background",
             original_scene,
-            ROOT / "runs" / "emotion6_full" / "twins" / "scene_context" / "disgust-224--scene_context--00.png",
+            ROOT / "assets" / "abstract_examples" / "scene-context-twin.png",
+            None,
             None,
             "#3e7c59",
         ),
@@ -80,7 +83,8 @@ def main() -> None:
             "EMBEDDED TEXT",
             "insert conflicting affect",
             original_scene,
-            ROOT / "runs" / "emotion6_full" / "twins" / "embedded_text" / "disgust-224--embedded_text--00.png",
+            ROOT / "assets" / "abstract_examples" / "embedded-text-twin.png",
+            None,
             None,
             "#3f68a8",
         ),
@@ -97,7 +101,7 @@ def main() -> None:
     small_font = font(20)
     footer_font = font(23, bold=True)
 
-    for index, (title, operation, before_path, after_path, crop, accent) in enumerate(examples):
+    for index, (title, operation, before_path, after_path, before_crop, after_crop, accent) in enumerate(examples):
         x0 = margin + index * (card_w + gap)
         x1 = x0 + card_w
         draw.rounded_rectangle((x0, 10, x1, 373), radius=12, fill="#fbfbfb", outline=accent, width=3)
@@ -109,8 +113,8 @@ def main() -> None:
         centred(draw, (left_x + image_w // 2, 65), "ORIGINAL", label_font, "#444444")
         centred(draw, (right_x + image_w // 2, 65), "TWIN", label_font, accent)
 
-        before = fit_image(before_path, (image_w, image_h), crop)
-        after = fit_image(after_path, (image_w, image_h), crop)
+        before = fit_image(before_path, (image_w, image_h), before_crop)
+        after = fit_image(after_path, (image_w, image_h), after_crop)
         canvas.paste(before, (left_x, image_y))
         canvas.paste(after, (right_x, image_y))
         draw.rectangle((left_x, image_y, left_x + image_w, image_y + image_h), outline="#777777", width=2)
@@ -128,13 +132,20 @@ def main() -> None:
         centred(draw, ((x0 + x1) // 2, 327), "one cue changed; other content preserved", font(16), "#666666")
 
     draw.rounded_rectangle((margin, 399, width - margin, 504), radius=12, fill="#f0f5f5", outline="#4a7777", width=2)
-    centred(draw, (width // 2, 414), "PAIRED MODEL AUDIT", footer_font, "#285d5d")
+    centred(draw, (width // 2, 414), "REPORT-CONDITIONED COUNTERFACTUAL AUDIT", footer_font, "#285d5d")
     centred(
         draw,
-        (width // 2, 455),
-        "emotion + valence--arousal   |   cue responsiveness   |   selective invariance   |   evidence grounding   |   conflict calibration",
-        small_font,
+        (width // 2, 450),
+        "1  model reports cue on original   ->   2  report selects visible region   ->   3  intervene   ->   4  re-query the same model",
+        font(18),
         "#222222",
+    )
+    centred(
+        draw,
+        (width // 2, 478),
+        "test: reported-target response  >  unreported-cue and matched-region controls",
+        font(17),
+        "#555555",
     )
 
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
