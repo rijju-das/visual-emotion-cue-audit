@@ -129,6 +129,11 @@ def generate(config: Dict) -> Dict:
             max_candidates=int(config["run"].get("object_max_candidates", 8)),
             superpixel_fallback=bool(config["run"].get("superpixel_fallback", True)),
             superpixel_count=int(config["run"].get("superpixel_count", 48)),
+            semantic_model=config["model"].get(
+                "semantic_model", "nvidia/segformer-b0-finetuned-ade-512-512"
+            ),
+            semantic_score_threshold=float(config["run"].get("semantic_score_threshold", 0.45)),
+            semantic_local_files_only=bool(config["model"].get("semantic_local_files_only", False)),
         ),
         FaceActionRegionIntervention(
             config["assets"]["face_landmarker"],

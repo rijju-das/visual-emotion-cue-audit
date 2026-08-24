@@ -7,7 +7,7 @@
     "audit_manifest": "data/audit80/manifest.jsonl"
   },
   "run": {
-    "output_dir": "runs/emotion6_abaw80_vlm_subject_background_server",
+    "output_dir": "runs/emotion6_abaw80_vlm_semantic_regions_server",
     "limit_per_class": 10,
     "text_conflict": true,
     "save_all_candidates": false,
@@ -19,16 +19,19 @@
     "object_max_candidates": 8,
     "superpixel_fallback": true,
     "superpixel_count": 48,
+    "semantic_score_threshold": 0.45,
     "face_backend": "mediapipe",
     "matched_controls": true
   },
   "model": {
     "checkpoint": "checkpoints/resnet18_multitask.pt",
+    "semantic_model": "nvidia/segformer-b0-finetuned-ade-512-512",
+    "semantic_local_files_only": false,
     "vlm_model": "HuggingFaceTB/SmolVLM-500M-Instruct",
     "enable_vlm": true,
     "vlm_local_files_only": false,
     "vlm_pair_limit_per_cue": 0,
-    "vlm_cache_dir": "runs/emotion6_abaw80_vlm_subject_background_server/vlm_cache"
+    "vlm_cache_dir": "runs/emotion6_abaw80_vlm_semantic_regions_server/vlm_cache"
   },
   "assets": {
     "face_landmarker": "assets/mediapipe/face_landmarker.task",

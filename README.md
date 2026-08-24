@@ -36,7 +36,7 @@ export XDG_CACHE_HOME="$PWD/.cache"
 
 Use `.venv/bin/affective-twins all --config configs/emotion6_abaw80_vlm_server.json` after a checkpoint exists to run generation, evaluation, and reporting together. The GPU workflow is also available in `jobs/full_vlm_gpu.job`.
 
-The strengthened subject/background and landmark run uses `configs/emotion6_abaw80_vlm_subject_background_server.json`; `jobs/full_vlm_gpu.job` is already configured for it. It writes to `runs/emotion6_abaw80_vlm_subject_background_server/`, leaving both earlier runs untouched. Each eligible colour image retains both the complete-subject and background-light twins rather than selecting only one. Mask R-CNN weights are downloaded into `.cache/torch` on the first server run. If no qualifying instance is detected, a dependency-free SLIC-style superpixel region is used and marked in metadata; rectangular grid patches are never used.
+The strengthened semantic-region and landmark run uses `configs/emotion6_abaw80_vlm_subject_background_server.json`; `jobs/full_vlm_gpu.job` is already configured for it. It writes to `runs/emotion6_abaw80_vlm_semantic_regions_server/`, leaving earlier runs untouched. SegFormer on ADE20K produces named, separately retained regions such as `person`, `wall`, `floor`, `ceiling`, and `dark_background`; the locator scores these candidates but does not collapse them into a local patch. Mask R-CNN provides the whole-subject fallback. If no qualifying instance is detected, connected SLIC-style superpixels are grown into an irregular region and marked in metadata. A single superpixel is forbidden, masks with rectangularity at or above 0.86 are rejected, and grid patches are never used.
 
 ## Outputs
 

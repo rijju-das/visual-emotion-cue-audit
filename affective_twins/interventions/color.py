@@ -25,6 +25,10 @@ class ColorIntervention:
         max_candidates: int = 8,
         superpixel_fallback: bool = True,
         superpixel_count: int = 48,
+        semantic_model: str = "nvidia/segformer-b0-finetuned-ade-512-512",
+        semantic_score_threshold: float = 0.45,
+        semantic_local_files_only: bool = False,
+        semantic_provider: Optional[Callable[[Image.Image], List[Dict]]] = None,
         mask_provider: Optional[Callable[[Image.Image], List[Dict]]] = None,
     ):
         # Retained for compatibility with old configs; grid cells are no longer used.
@@ -37,11 +41,159 @@ class ColorIntervention:
         self.max_candidates = max_candidates
         self.superpixel_fallback = superpixel_fallback
         self.superpixel_count = superpixel_count
+        self.semantic_model_name = semantic_model
+        self.semantic_score_threshold = semantic_score_threshold
+        self.semantic_local_files_only = semantic_local_files_only
+        self.semantic_provider = semantic_provider
         self.mask_provider = mask_provider
         self._model = None
         self._categories = None
         self._device = None
+        self._semantic_processor = None
+        self._semantic_model = None
+        self._semantic_device = None
         self.unavailable_reason = ""
+
+    def _initialise_semantic(self) -> bool:
+        if self.semantic_provider is not None or self._semantic_model is not None:
+            return True
+        try:
+            import torch
+            from transformers import AutoImageProcessor, AutoModelForSemanticSegmentation
+
+            self._semantic_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self._semantic_processor = AutoImageProcessor.from_pretrained(
+                self.semantic_model_name,
+                local_files_only=self.semantic_local_files_only,
+            )
+            self._semantic_model = AutoModelForSemanticSegmentation.from_pretrained(
+                self.semantic_model_name,
+                local_files_only=self.semantic_local_files_only,
+            ).to(self._semantic_device).eval()
+            return True
+        except (ImportError, OSError, RuntimeError, ValueError) as error:
+            self.unavailable_reason = "semantic_segmenter_unavailable:{}".format(type(error).__name__)
+            return False
+
+    def _semantic_regions(self, image: Image.Image) -> List[Dict]:
+        if self.semantic_provider is not None:
+            raw_regions = self.semantic_provider(image)
+        else:
+            if not self._initialise_semantic():
+                return []
+            import torch
+
+            inputs = self._semantic_processor(images=image.convert("RGB"), return_tensors="pt")
+            inputs = {name: value.to(self._semantic_device) for name, value in inputs.items()}
+            with torch.inference_mode():
+                outputs = self._semantic_model(**inputs)
+                probabilities = torch.nn.functional.interpolate(
+                    outputs.logits,
+                    size=(image.height, image.width),
+                    mode="bilinear",
+                    align_corners=False,
+                ).softmax(dim=1)[0]
+                confidence, segmentation = probabilities.max(dim=0)
+            segmentation = segmentation.detach().cpu().numpy()
+            confidence = confidence.detach().cpu().numpy()
+            raw_regions = []
+            for class_id in np.unique(segmentation):
+                mask = segmentation == class_id
+                label = self._semantic_model.config.id2label.get(
+                    int(class_id), str(int(class_id))
+                )
+                raw_regions.append({
+                    "mask": mask,
+                    "label": str(label).strip().lower(),
+                    "score": float(confidence[mask].mean()),
+                })
+
+        priority = {
+            "person": 0,
+            "wall": 1,
+            "floor": 2,
+            "ceiling": 3,
+            "door": 4,
+            "windowpane": 5,
+            "building": 6,
+            "road": 7,
+            "sky": 8,
+            "earth": 9,
+            "grass": 10,
+        }
+        regions = []
+        person_union = np.zeros((image.height, image.width), dtype=bool)
+        for region in raw_regions:
+            raw_mask = region["mask"]
+            if isinstance(raw_mask, Image.Image):
+                mask = np.asarray(raw_mask.resize(image.size, Image.Resampling.NEAREST)) > 0
+            else:
+                mask = np.asarray(raw_mask).squeeze().astype(bool)
+                if mask.shape != (image.height, image.width):
+                    mask = np.asarray(
+                        Image.fromarray(mask).resize(image.size, Image.Resampling.NEAREST)
+                    ).astype(bool)
+            area = float(mask.mean())
+            score = float(region.get("score", 1.0))
+            label = str(region.get("label", "semantic_region")).strip().lower()
+            if score < self.semantic_score_threshold:
+                continue
+            if not self.min_area_fraction <= area <= min(0.85, self.max_area_fraction + 0.20):
+                continue
+            if label == "person":
+                person_union |= mask
+            regions.append({
+                "binary": mask,
+                "label": label,
+                "score": score,
+                "area_fraction": area,
+                "segmenter": "segformer_ade20k_semantic",
+                "priority": priority.get(label.split(",")[0], 50),
+            })
+
+        # A perceptually dark background is useful even when ADE20K divides it
+        # across wall, floor, and other stuff classes. Person pixels are excluded.
+        luminance = np.asarray(image.convert("L"), dtype=np.float32) / 255.0
+        dark_threshold = min(0.30, float(np.quantile(luminance, 0.28)))
+        dark_background = (luminance <= dark_threshold) & ~person_union
+        dark_area = float(dark_background.mean())
+        if self.min_area_fraction <= dark_area <= 0.65:
+            regions.append({
+                "binary": dark_background,
+                "label": "dark_background",
+                "score": 1.0,
+                "area_fraction": dark_area,
+                "segmenter": "segformer_plus_luminance_background",
+                "priority": 11,
+            })
+        regions.sort(key=lambda region: (region["priority"], -region["area_fraction"]))
+        if regions:
+            self.unavailable_reason = ""
+        return regions[: self.max_candidates]
+
+    def _semantic_twins(self, image: Image.Image, regions: List[Dict]) -> List[GeneratedTwin]:
+        twins = []
+        for region_index, region in enumerate(regions):
+            mask = Image.fromarray(region["binary"].astype(np.uint8) * 255, mode="L")
+            label = region["label"]
+            twins.append(GeneratedTwin(
+                image=luminance_preserving_desaturate(image, mask),
+                mask=mask,
+                cue_family=self.cue_family,
+                operation="semantic_region_chroma_removal",
+                target_region=mask_bbox(mask),
+                metadata={
+                    "intervention_scope": "semantic_scene_entity",
+                    "semantic_region_id": region_index,
+                    "semantic_label": label,
+                    "semantic_score": region["score"],
+                    "semantic_mask_area_fraction": region["area_fraction"],
+                    "semantic_segmenter": region["segmenter"],
+                    "is_complete_person_region": label == "person",
+                    "is_control": False,
+                },
+            ))
+        return twins
 
     def _initialise(self) -> bool:
         if self.mask_provider is not None or self._model is not None:
@@ -144,27 +296,69 @@ class ColorIntervention:
                 + np.square((yy - (work_height - 1) / 2.0) / max(1.0, work_height * 0.42))
             )
         )
+        unique_labels = [int(label) for label in np.unique(labels)]
         global_colour = rgb.mean(axis=(0, 1))
-        proposals = []
-        for label in np.unique(labels):
+        mean_colours = {}
+        saliencies = {}
+        adjacency = {label: set() for label in unique_labels}
+        for label in unique_labels:
             small_region = labels == label
-            full_region = full_labels == label
-            area = float(full_region.mean())
-            if not self.min_area_fraction <= area <= self.max_area_fraction:
-                continue
-            colour_contrast = float(np.linalg.norm(rgb[small_region].mean(axis=0) - global_colour))
+            mean_colours[label] = rgb[small_region].mean(axis=0)
+            colour_contrast = float(np.linalg.norm(mean_colours[label] - global_colour))
             centrality = float(centre_prior[small_region].mean())
             touches_border = bool(
-                small_region[0].any() or small_region[-1].any() or small_region[:, 0].any() or small_region[:, -1].any()
+                small_region[0].any() or small_region[-1].any()
+                or small_region[:, 0].any() or small_region[:, -1].any()
             )
-            saliency = 0.55 * centrality + 0.45 * min(1.0, colour_contrast * 2.0)
+            saliencies[label] = 0.55 * centrality + 0.45 * min(1.0, colour_contrast * 2.0)
             if touches_border:
-                saliency *= 0.78
+                saliencies[label] *= 0.78
+
+        for left, right in zip(labels[:, :-1].ravel(), labels[:, 1:].ravel()):
+            if left != right:
+                adjacency[int(left)].add(int(right))
+                adjacency[int(right)].add(int(left))
+        for top, bottom in zip(labels[:-1].ravel(), labels[1:].ravel()):
+            if top != bottom:
+                adjacency[int(top)].add(int(bottom))
+                adjacency[int(bottom)].add(int(top))
+
+        proposals = []
+        for seed in sorted(unique_labels, key=lambda label: saliencies[label], reverse=True):
+            grown = {seed}
+            frontier = set(adjacency[seed])
+            while frontier and len(grown) < 12:
+                neighbour = min(
+                    frontier,
+                    key=lambda label: float(np.linalg.norm(mean_colours[label] - mean_colours[seed])),
+                )
+                frontier.remove(neighbour)
+                if float(np.linalg.norm(mean_colours[neighbour] - mean_colours[seed])) > 0.20:
+                    continue
+                candidate_labels = grown | {neighbour}
+                candidate_area = float(np.isin(full_labels, list(candidate_labels)).mean())
+                if candidate_area > self.max_area_fraction:
+                    continue
+                grown.add(neighbour)
+                frontier.update(adjacency[neighbour] - grown)
+
+            # One SLIC cell can retain its rectangular initialization. Requiring
+            # multiple connected cells and rejecting high rectangular fill makes
+            # a patch-shaped fallback impossible.
+            if len(grown) < 2:
+                continue
+            full_region = np.isin(full_labels, list(grown))
+            area = float(full_region.mean())
+            rectangularity = self._rectangularity(full_region)
+            if not self.min_area_fraction <= area <= self.max_area_fraction or rectangularity >= 0.86:
+                continue
             proposals.append({
                 "mask": full_region.astype(np.float32),
-                "label": "superpixel_region_{}".format(int(label)),
-                "score": max(0.01, saliency),
-                "segmenter": "numpy_slic_superpixel_fallback",
+                "label": "superpixel_component_{}".format(seed),
+                "score": max(0.01, saliencies[seed]),
+                "segmenter": "numpy_slic_superpixel_connected_region_fallback",
+                "component_count": len(grown),
+                "mask_rectangularity": rectangularity,
             })
         proposals.sort(key=lambda proposal: proposal["score"], reverse=True)
         if proposals:
@@ -176,6 +370,14 @@ class ColorIntervention:
         intersection = np.logical_and(left, right).sum()
         union = np.logical_or(left, right).sum()
         return float(intersection / union) if union else 0.0
+
+    @staticmethod
+    def _rectangularity(mask: np.ndarray) -> float:
+        rows, columns = np.where(mask)
+        if not len(rows):
+            return 1.0
+        bounding_area = (rows.max() - rows.min() + 1) * (columns.max() - columns.min() + 1)
+        return float(mask.sum() / bounding_area)
 
     def _object_masks(self, image: Image.Image) -> List[Dict]:
         width, height = image.size
@@ -194,13 +396,20 @@ class ColorIntervention:
             area_fraction = float(binary.mean())
             if not self.min_area_fraction <= area_fraction <= self.max_area_fraction:
                 continue
+            rectangularity = self._rectangularity(binary)
+            segmenter = str(proposal.get("segmenter", "provided_object_masks"))
+            maximum_rectangularity = 0.86 if "superpixel" in segmenter else 0.97
+            if rectangularity >= maximum_rectangularity:
+                continue
             if any(self._iou(binary, item["binary"]) >= 0.85 for item in accepted):
                 continue
             accepted.append({
                 "binary": binary,
                 "label": str(proposal.get("label", "object")),
                 "score": float(proposal.get("score", 1.0)),
-                "segmenter": str(proposal.get("segmenter", "provided_object_masks")),
+                "segmenter": segmenter,
+                "mask_rectangularity": rectangularity,
+                "superpixel_component_count": int(proposal.get("component_count", 0)),
                 "proposal_index": proposal_index,
                 "area_fraction": area_fraction,
             })
@@ -209,6 +418,12 @@ class ColorIntervention:
         return accepted
 
     def generate(self, image: Image.Image) -> List[GeneratedTwin]:
+        # Injected instance-mask providers are used by isolated tests. Normal runs
+        # first seek named scene entities such as person, wall, and floor.
+        semantic_regions = [] if self.mask_provider is not None and self.semantic_provider is None else self._semantic_regions(image)
+        if semantic_regions:
+            return self._semantic_twins(image, semantic_regions)
+
         proposals = self._object_masks(image)
         if not proposals:
             if not self.unavailable_reason:
@@ -237,13 +452,20 @@ class ColorIntervention:
         subject_mask = Image.fromarray(subject_binary.astype(np.uint8) * 255, mode="L")
         background_mask = Image.fromarray((~subject_binary).astype(np.uint8) * 255, mode="L")
         segmenters = sorted({proposal["segmenter"] for proposal in subject_proposals})
+        subject_rectangularity = self._rectangularity(subject_binary)
         shared = {
             "subject_type": subject_type,
             "subject_labels": [proposal["label"] for proposal in subject_proposals],
             "subject_instance_count": len(subject_proposals),
             "subject_mask_area_fraction": float(subject_binary.mean()),
+            "subject_mask_rectangularity": subject_rectangularity,
+            "superpixel_component_count": int(sum(
+                proposal.get("superpixel_component_count", 0) for proposal in subject_proposals
+            )),
             "object_segmenter": ";".join(segmenters),
-            "used_superpixel_fallback": any("superpixel" in name for name in segmenters),
+            "used_superpixel_fallback": any(
+                "superpixel" in name or "slic" in name for name in segmenters
+            ),
             "selection_rule": "merge_all_people_else_largest_area_times_confidence",
             "is_control": False,
         }

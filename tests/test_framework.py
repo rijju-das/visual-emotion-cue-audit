@@ -73,8 +73,9 @@ def test_colour_intervention_merges_people_and_preserves_subject_in_background_t
     image = Image.fromarray(array)
     left_person = np.zeros((80, 100), dtype=np.float32)
     right_person = np.zeros((80, 100), dtype=np.float32)
-    left_person[8:76, 8:32] = 1.0
-    right_person[15:75, 65:92] = 1.0
+    yy, xx = np.mgrid[:80, :100]
+    left_person[((xx - 20) / 12) ** 2 + ((yy - 42) / 34) ** 2 <= 1.0] = 1.0
+    right_person[((xx - 78) / 13) ** 2 + ((yy - 45) / 30) ** 2 <= 1.0] = 1.0
     twins = ColorIntervention(mask_provider=lambda _: [
         {"mask": left_person, "label": "person", "score": 0.99},
         {"mask": right_person, "label": "person", "score": 0.97},
@@ -101,8 +102,30 @@ def test_colour_intervention_uses_nonrectangular_superpixel_fallback():
     bounding_box_area = (rows.max() - rows.min() + 1) * (columns.max() - columns.min() + 1)
     assert twins[0].metadata["used_superpixel_fallback"]
     assert twins[0].metadata["subject_type"] == "salient_superpixel_region"
+    assert twins[0].metadata["superpixel_component_count"] >= 2
+    assert twins[0].metadata["subject_mask_rectangularity"] < 0.86
     assert "grid_cell" not in twins[0].metadata
     assert mask.sum() < 0.9 * bounding_box_area
+
+
+def test_colour_intervention_keeps_person_wall_and_floor_as_separate_entities():
+    image = Image.new("RGB", (100, 80), (120, 120, 120))
+    yy, xx = np.mgrid[:80, :100]
+    person = ((xx - 50) / 15) ** 2 + ((yy - 42) / 30) ** 2 <= 1.0
+    wall = (yy < 52) & ~person
+    floor = (yy >= 52) & ~person
+    generator = ColorIntervention(semantic_provider=lambda _: [
+        {"mask": person, "label": "person", "score": 0.99},
+        {"mask": wall, "label": "wall", "score": 0.97},
+        {"mask": floor, "label": "floor", "score": 0.96},
+    ])
+    twins = generator.generate(image)
+    by_label = {twin.metadata["semantic_label"]: twin for twin in twins}
+    assert {"person", "wall", "floor"} <= set(by_label)
+    assert all(twin.operation == "semantic_region_chroma_removal" for twin in twins)
+    assert np.array_equal(np.asarray(by_label["person"].mask) > 0, person)
+    assert by_label["person"].metadata["is_complete_person_region"]
+    assert "grid_cell" not in by_label["wall"].metadata
 
 
 def test_context_mask_and_twin_are_well_formed():
