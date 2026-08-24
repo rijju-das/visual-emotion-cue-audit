@@ -3,6 +3,7 @@
 import platform
 import sys
 import math
+import re
 from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -210,6 +211,142 @@ def _candidate_area(candidate) -> float:
     return float(np.asarray(candidate.mask.convert("L"), dtype=np.float32).mean() / 255.0)
 
 
+_CONCEPT_ALIASES = {
+    "person": {"person", "people", "man", "men", "woman", "women", "girl", "boy", "child", "children", "body", "shirt", "clothing", "clothes", "dress"},
+    "background": {"background", "shadow", "shadows", "darkness"},
+    "sky": {"sky", "cloud", "clouds"},
+    "wall": {"wall", "walls"},
+    "floor": {"floor", "ground", "pavement"},
+    "water": {"water", "sea", "ocean", "lake", "river"},
+    "cake": {"cake", "cakes", "cupcake", "cupcakes"},
+    "television": {"tv", "television", "screen"},
+    "building": {"building", "buildings", "house"},
+    "tree": {"tree", "trees"},
+    "flower": {"flower", "flowers"},
+    "grass": {"grass", "lawn"},
+    "dirt": {"dirt", "soil", "mud"},
+    "boat": {"boat", "boats", "ship"},
+    "vase": {"vase", "vases"},
+    "toilet": {"toilet", "toilets"},
+}
+_NON_REGION_WORDS = {
+    "red", "orange", "yellow", "green", "blue", "purple", "pink", "white", "black", "grey", "gray",
+    "bright", "brightness", "dim", "colour", "color", "lighting", "light", "emotion", "nothing", "none",
+}
+
+
+def _region_terms(text: str):
+    normalized = re.sub(r"[^a-z0-9]+", " ", str(text).lower()).strip()
+    raw = set(normalized.split()) - _NON_REGION_WORDS
+    terms = set(raw)
+    for canonical, aliases in _CONCEPT_ALIASES.items():
+        if raw & aliases:
+            terms.add(canonical)
+    return terms
+
+
+def _candidate_region_text(candidate) -> str:
+    metadata = candidate.metadata
+    values = [
+        metadata.get("panoptic_label", ""),
+        metadata.get("semantic_label", ""),
+        " ".join(metadata.get("subject_labels", [])),
+        metadata.get("subject_type", ""),
+        " ".join(metadata.get("ocr_tokens", [])),
+    ]
+    return " ".join(str(value) for value in values if value)
+
+
+def _ground_reported_evidence(
+    vlm: SmolVLMAdapter,
+    source: Image.Image,
+    candidates,
+    cue: str,
+    evidence: str,
+    sample_id: str,
+):
+    """Ground reported evidence conservatively; never substitute an unrelated salient region."""
+    labels = [_candidate_label(candidate) for candidate in candidates]
+    if cue == CueFamily.FACE.value:
+        requested = SmolVLMAdapter._choice(evidence, ["brows", "eyes", "mouth"])
+        if requested is None:
+            return {"index": None, "status": "facial_component_not_explicit", "candidate_labels": labels}
+        matches = []
+        for index, candidate in enumerate(candidates):
+            region = str(candidate.metadata.get("au_region", ""))
+            component = "brows" if region.startswith("brow") else "eyes" if region.startswith("eye") else "mouth" if region.startswith("mouth") else ""
+            if component == requested:
+                matches.append(index)
+        if len(matches) != 1:
+            return {"index": None, "status": "facial_component_not_uniquely_localized", "candidate_labels": labels}
+        return {
+            "index": matches[0],
+            "status": "exact_constrained_facial_component",
+            "response": requested,
+            "candidate_labels": labels,
+            "matched_terms": [requested],
+        }
+    if cue == CueFamily.CONTEXT.value:
+        return {
+            "index": 0,
+            "status": "full_reported_scene_context",
+            "response": evidence,
+            "candidate_labels": labels,
+            "matched_terms": sorted(_region_terms(evidence)),
+        }
+
+    evidence_terms = _region_terms(evidence)
+    scored = []
+    for index, candidate in enumerate(candidates):
+        candidate_terms = _region_terms(_candidate_region_text(candidate))
+        overlap = evidence_terms & candidate_terms
+        if overlap:
+            scored.append((index, len(overlap), sorted(overlap)))
+    if not scored:
+        return {
+            "index": None,
+            "status": "reported_evidence_absent_from_candidate_labels",
+            "candidate_labels": labels,
+            "evidence_terms": sorted(evidence_terms),
+        }
+    best_score = max(item[1] for item in scored)
+    best = [item for item in scored if item[1] == best_score]
+    if len(best) == 1:
+        index, _, overlap = best[0]
+        return {
+            "index": index,
+            "status": "exact_lexical_region_match",
+            "response": evidence,
+            "candidate_labels": labels,
+            "matched_terms": overlap,
+        }
+
+    ambiguous_indices = [item[0] for item in best]
+    selection = vlm.select_evidence_region(
+        source,
+        cue,
+        [labels[index] for index in ambiguous_indices],
+        evidence=evidence,
+        cache_key=sample_id,
+    )
+    if selection.get("index") is None:
+        return {
+            **selection,
+            "status": "ambiguous_region_{}".format(selection.get("status", "invalid")),
+            "candidate_labels": labels,
+            "ambiguous_candidate_indices": ambiguous_indices,
+        }
+    selected = ambiguous_indices[int(selection["index"])]
+    return {
+        **selection,
+        "index": selected,
+        "status": "lexical_match_plus_order_invariant_vlm",
+        "candidate_labels": labels,
+        "ambiguous_candidate_indices": ambiguous_indices,
+        "matched_terms": best[int(selection["index"])][2],
+    }
+
+
 def _report_condition_candidates(
     vlm: SmolVLMAdapter,
     locator: ResNetAffectModel,
@@ -252,6 +389,7 @@ def _report_condition_candidates(
         candidate.metadata.update({
             "is_control": False,
             "report_match": False,
+            "reported_evidence_region_match": False,
             "report_condition_role": "unreported_cue_comparator" if valid_report else "invalid_report_comparator",
             "selection_model": "deterministic_unreported_cue_comparator",
             "selected_candidate_label": _candidate_label(candidate),
@@ -264,16 +402,17 @@ def _report_condition_candidates(
             return [], "reported_text_not_groundable_by_ocr"
     else:
         eligible = list(range(len(candidates)))
-    labels = [_candidate_label(candidates[index]) for index in eligible]
-    selection = vlm.select_evidence_region(
+    eligible_candidates = [candidates[index] for index in eligible]
+    selection = _ground_reported_evidence(
+        vlm,
         source,
+        eligible_candidates,
         cue,
-        labels,
-        evidence=report.evidence,
-        cache_key=sample.sample_id,
+        report.evidence,
+        sample.sample_id,
     )
     if selection.get("index") is None:
-        return [], "reported_region_selection_invalid"
+        return [], selection.get("status", "reported_evidence_not_grounded")
     selected = eligible[int(selection["index"])]
     target = candidates[selected]
     target_was_annotation_control = bool(target.metadata.get("is_control", False))
@@ -282,8 +421,10 @@ def _report_condition_candidates(
         "is_control": False,
         "report_match": True,
         "report_condition_role": "reported_cue_target",
-        "selection_model": "same_vlm_report_conditioned_region_selection",
+        "selection_model": "exact_reported_evidence_grounding",
         "selected_candidate_label": _candidate_label(target),
+        "reported_evidence_region_match": True,
+        "reported_evidence_matched_terms": selection.get("matched_terms", []),
         "reported_region_selection_status": selection["status"],
         "reported_region_selection_response": selection["response"],
         "reported_region_candidates": selection["candidate_labels"],
@@ -306,6 +447,7 @@ def _report_condition_candidates(
             control.metadata.update({
                 "is_control": True,
                 "report_match": False,
+                "reported_evidence_region_match": False,
                 "report_condition_role": "same_cue_matched_region_control",
                 "selection_model": "mask_area_matched_within_reported_cue_family",
                 "control_for_candidate": selected,
@@ -335,6 +477,7 @@ def generate(config: Dict) -> Dict:
             config["model"]["vlm_model"],
             local_files_only=bool(config["model"].get("vlm_local_files_only", False)),
             cache_dir=config["model"].get("vlm_cache_dir"),
+            allowed_cues=config["run"].get("enabled_cues"),
         )
         source_images = []
         for sample in samples:
@@ -377,6 +520,8 @@ def generate(config: Dict) -> Dict:
         ContextIntervention(),
         TextIntervention(config["assets"]["tesseract"], bool(config["run"].get("text_conflict", True))),
     ]
+    enabled_cues = set(config["run"].get("enabled_cues", [cue.value for cue in CueFamily]))
+    generators = [generator for generator in generators if generator.cue_family.value in enabled_cues]
     intervention_rows = []
     output_dir.mkdir(parents=True, exist_ok=True)
     write_jsonl(output_dir / "samples.jsonl", [sample.to_dict() for sample in samples])
@@ -398,6 +543,28 @@ def generate(config: Dict) -> Dict:
         for generator in generators:
             allowed_cues = sample.metadata.get("allowed_cues")
             if allowed_cues and generator.cue_family.value not in allowed_cues:
+                if (
+                    report_conditioned
+                    and report
+                    and report.raw.get("parse_status") == "valid_constrained"
+                    and report.evidence_cue == generator.cue_family.value
+                ):
+                    intervention_rows.append(Intervention(
+                        intervention_id="{}--{}--skipped".format(sample.sample_id, generator.cue_family.value),
+                        sample_id=sample.sample_id,
+                        cue_family=generator.cue_family,
+                        operation="skipped",
+                        image_path="",
+                        mask_path="",
+                        eligible=False,
+                        skip_reason="reported_cue_disallowed_for_sample",
+                        metadata={
+                            "report_conditioned": True,
+                            "original_reported_cue": report.evidence_cue,
+                            "original_reported_evidence": report.evidence,
+                            "report_condition_role": "reported_cue_ungroundable",
+                        },
+                    ).to_dict())
                 continue
             if generator.cue_family == CueFamily.TEXT:
                 candidates = generator.generate(source, Path(sample.image_path), sample.emotion)
@@ -500,7 +667,7 @@ def generate(config: Dict) -> Dict:
     )
     skipped = Counter(row["cue_family"] for row in intervention_rows if not row["eligible"])
     provenance = {
-        "framework_version": "0.4.0",
+        "framework_version": "0.5.0",
         "python": sys.version,
         "platform": platform.platform(),
         "torch": torch.__version__,
@@ -579,6 +746,7 @@ def evaluate(config: Dict) -> Dict:
             config["model"]["vlm_model"],
             local_files_only=bool(config["model"].get("vlm_local_files_only", False)),
             cache_dir=config["model"].get("vlm_cache_dir"),
+            allowed_cues=config["run"].get("enabled_cues"),
         )
         # Reuse the exact pre-intervention reports that conditioned generation.
         # This prevents a regenerated answer from silently changing the audit target.
@@ -647,6 +815,9 @@ def evaluate(config: Dict) -> Dict:
             "original_reported_cue": intervention.get("metadata", {}).get("original_reported_cue", ""),
             "original_reported_evidence": intervention.get("metadata", {}).get("original_reported_evidence", ""),
             "selected_candidate_label": intervention.get("metadata", {}).get("selected_candidate_label", ""),
+            "reported_evidence_region_match": float(intervention.get("metadata", {}).get("reported_evidence_region_match", False)),
+            "reported_region_selection_status": intervention.get("metadata", {}).get("reported_region_selection_status", ""),
+            "reported_evidence_matched_terms": ";".join(intervention.get("metadata", {}).get("reported_evidence_matched_terms", [])),
             "au_annotation_backed": float(intervention.get("metadata", {}).get("au_annotation_backed", False)),
             "target_active_aus": ";".join(intervention.get("metadata", {}).get("target_active_aus", [])),
             "eligible": True,
@@ -716,7 +887,8 @@ def evaluate(config: Dict) -> Dict:
                 "vlm_va_distance": float(math.hypot(vt.valence - vo.valence, vt.arousal - vo.arousal)),
             })
         rows.append(row)
-    summary = aggregate(rows)
+    enabled_cues = config["run"].get("enabled_cues", [cue.value for cue in CueFamily])
+    summary = aggregate(rows, expected_cues=enabled_cues)
     summary.update({
         "dataset": config["dataset"]["name"],
         "n_samples": len(samples),
@@ -724,8 +896,10 @@ def evaluate(config: Dict) -> Dict:
         "n_skipped": len(intervention_rows) - len(eligible),
         "skips_by_reason": dict(Counter(row["skip_reason"] for row in intervention_rows if not row["eligible"])),
         "vlm_enabled": bool(config["model"].get("enable_vlm", False)),
+        "vlm_model": config["model"].get("vlm_model", ""),
         "vlm_pairs_evaluated": len(vlm_twins_by_id),
         "report_conditioned": bool(config["run"].get("report_conditioned", False)),
+        "audited_cue_families": list(enabled_cues),
         "reported_cue_target_coverage": (
             len({
                 row["sample_id"] for row in rows
@@ -741,6 +915,15 @@ def evaluate(config: Dict) -> Dict:
         summary["original_report_valid_rate"] = (
             float(np.mean([row.get("valid_report", False) for row in saved_reports]))
             if saved_reports else 0.0
+        )
+        valid_report_count = sum(row.get("valid_report", False) for row in saved_reports)
+        grounded_sample_count = len({
+            row["sample_id"] for row in rows
+            if row.get("report_condition_role") == "reported_cue_target"
+            and row.get("reported_evidence_region_match") == 1.0
+        })
+        summary["valid_report_exact_grounding_rate"] = (
+            grounded_sample_count / valid_report_count if valid_report_count else 0.0
         )
     write_csv(output_dir / "pair_metrics.csv", rows)
     write_json(output_dir / "summary.json", summary)

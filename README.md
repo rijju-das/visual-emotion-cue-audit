@@ -2,14 +2,14 @@
 
 An end-to-end, standalone framework for auditing whether affect models respond to the same inspectable evidence they report using.
 
-The framework creates matched twins that alter one cue family at a time:
+The framework can create matched twins that alter one cue family at a time:
 
 - `color_lighting`: luminance-preserving chroma removal over complete Mask2Former/SegFormer semantic entities (person, object, wall, floor, or another surface), with Mask R-CNN subject/background fallback and no rectangular patch intervention;
 - `facial_action_region`: expanded landmark-contoured eyebrow, eye, or mouth masks with strong blur/pixelation; Aff-Wild2 examples additionally retain frame-level AU support and identify inactive-region controls;
 - `scene_context`: panoptic-foreground-preserving background chroma/detail attenuation;
-- `embedded_text`: OCR-localized text removal when text exists, plus contradictory affect-word insertion.
+- `embedded_text`: optional OCR-localized text removal for datasets containing genuine text; disabled in the present Emotion6 + Aff-Wild2 audit because the selected images contain no text evidence.
 
-The primary protocol is report-conditioned. The target VLM first predicts emotion and reports its strongest cue family and visible evidence on the untouched image. The same VLM then grounds that report to a segmented object, facial component, scene context, or OCR text region. Only afterward is the reported evidence manipulated. Unreported cue interventions and nearest-area regions within the reported cue family are retained as explicit comparators. The same target VLM is queried again to measure original-class probability change, prediction flips, entropy, cue retention, and reported-target minus control effects. Every twin has a mask and a JSONL manifest entry; invalid or ungroundable reports remain explicit.
+The primary protocol is report-conditioned. For this dataset, the target VLM must select among three evidence-bearing cue families: colour/lighting, facial action region, and scene context. It names cue-specific visible evidence on the untouched image: one object or surface for colour, one of brows/eyes/mouth for facial evidence, or a background setting for context. That exact answer must match an eligible segmented entity, landmark component, or context mask. Ambiguous object matches are accepted only when the VLM selects the same physical region under multiple shuffled option orders. No unrelated region is substituted when grounding fails. Only afterward is the reported evidence manipulated. Unreported cue interventions and nearest-area regions within the reported cue family are retained as explicit comparators. The same target VLM is queried again to measure original-class probability change, prediction flips, entropy, cue retention, and reported-target minus control effects. Every twin has a mask and a JSONL manifest entry; invalid or ungroundable reports remain explicit.
 
 ## Project boundary
 
@@ -37,13 +37,21 @@ export XDG_CACHE_HOME="$PWD/.cache"
 .venv/bin/affective-twins report
 ```
 
-Use `.venv/bin/affective-twins all --config configs/emotion6_abaw80_vlm_subject_background_server.json` after a checkpoint exists to run report-conditioned generation, evaluation, and reporting together. The GPU workflow is also available in `jobs/full_vlm_gpu.job`.
+Use `.venv/bin/affective-twins all --config configs/emotion6_abaw80_exact_qwen3vl4b_server.json` after a checkpoint exists to run the stronger Qwen3-VL-4B report-conditioned audit. The GPU workflow is available in `jobs/full_vlm_gpu.job`.
 
-The report-conditioned panoptic-object, AU, and context run uses `configs/emotion6_abaw80_vlm_subject_background_server.json`; `jobs/full_vlm_gpu.job` is configured for it. It writes to `runs/emotion6_abaw80_vlm_report_conditioned_server/`, leaving earlier runs untouched. Mask2Former proposes complete objects and background surfaces. When colour is reported, the VLM chooses among those named regions; when facial evidence is reported, it chooses brows, eyes, or mouth. Context has one subject-preserving background candidate. Reported text is eligible only when OCR grounds text already present in the original image; affect-word insertion is retained only as an unreported-cue challenge. A failed region choice is recorded as ineligible rather than replaced by a locator-selected target.
+The exact-grounding configurations are `configs/emotion6_abaw80_exact_qwen3vl4b_server.json` and `configs/emotion6_abaw80_exact_smolvlm500m_server.json`. Their outputs are isolated in `runs/emotion6_abaw80_exact_qwen3vl4b_server/` and `runs/emotion6_abaw80_exact_smolvlm500m_server/`, leaving every earlier run untouched. Mask2Former and SegFormer propose complete objects and background surfaces. A colour report must name one of those entities; a face report must say brows, eyes, or mouth; and a context report targets the subject-preserving full background. Embedded text is neither offered to the VLM nor generated as an intervention in these configurations. A failed or order-sensitive grounding is recorded as ineligible rather than replaced by a locator-selected target.
+
+To compare the stronger VLM with the compact baseline on the server, submit:
+
+```bash
+sbatch jobs/compare_vlms_gpu.job
+```
+
+This runs both audits sequentially and writes `comparison.md`, `comparison.csv`, and `comparison.json` to `runs/vlm_exact_grounding_comparison/`. Each model is evaluated against its own report and its own induced twins; the script does not pool unlike interventions.
 
 ## Report-conditioned outputs
 
-The new run is written to `runs/emotion6_abaw80_vlm_report_conditioned_server/`:
+Each exact-grounding run contains:
 
 - `original_reports.jsonl`: the immutable pre-intervention emotion, cue, evidence, caption, and report validity used to condition twin generation;
 - `interventions.jsonl`: the selected reported-cue target, its grounding decision, unreported-cue comparators, matched-region controls, masks, and explicit skips;
@@ -87,10 +95,10 @@ The matched-control analysis supports selective colour sensitivity: the mean tar
 
 ## VLM status
 
-`SmolVLMAdapter` implements constrained reporting of discrete emotion, valence--arousal, confidence, cue identification, visible evidence, and a literal caption. The full run evaluates all 201 target pairs. Of these, 188 pairs have valid constrained outputs (93.5%); invalid outputs are retained and excluded from VLM-specific aggregates rather than silently repaired. Cue-grounding accuracy is 35.1% (95% CI [28.7%, 42.0%]), and mean original--twin caption Jaccard similarity is 0.416. These results measure the behaviour of the 500M checkpoint and should not be generalized to VLMs as a class.
+The VLM adapter implements constrained reporting of discrete emotion, valence--arousal, confidence, cue identification, cue-specific visible evidence, and a literal caption. The primary model is `Qwen/Qwen3-VL-4B-Instruct`; `HuggingFaceTB/SmolVLM-500M-Instruct` is retained as a compact baseline. Invalid outputs and evidence that cannot be grounded exactly are retained as audit failures rather than silently repaired. The earlier 500M result below predates exact evidence grounding and should not be used as the final claim: it evaluated 201 target pairs, obtained 188 valid constrained outputs (93.5%), cue-family grounding accuracy of 35.1% (95% CI [28.7%, 42.0%]), and caption Jaccard similarity of 0.416.
 
 ## Interpretation boundary
 
-This is a complete executable research framework, not proof of perceptual causality. Current face edits precisely localize AU-related facial components, but still ablate visual evidence rather than synthesizing exact muscle activations. Object masks are limited to the instance categories recognized by the pretrained detector, and samples with no qualifying object are explicitly skipped. Context masks use a deterministic saliency prior rather than semantic segmentation. Human validation remains required before reporting the twins as perception-preserving causal interventions. The CAUSE composite in `summary.json` is explicitly unvalidated and should be treated as a run diagnostic, not a leaderboard score.
+This is a complete executable research framework, not proof of perceptual causality. Current face edits localize and strongly blur/pixelate AU-related brows, eyes, or mouth evidence, but do not synthesize anatomically exact muscle activations. Object masks are limited to the categories recognized by the pretrained panoptic and semantic segmenters, and reports naming an unavailable entity are explicitly skipped. Context intervention attenuates the segmented scene background while preserving detected foreground subjects. Human validation remains required before reporting the twins as perception-preserving causal interventions. The CAUSE composite in `summary.json` is explicitly unvalidated and should be treated as a run diagnostic, not a leaderboard score.
 
 The original colour-only pilot and anonymous one-page PDF remain in `outputs/`, `abstract/`, and `submission/` for provenance.

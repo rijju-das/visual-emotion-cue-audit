@@ -76,7 +76,10 @@ def expected_calibration_error(rows: Iterable[Dict], bins: int = 10) -> float:
     return float(result)
 
 
-def aggregate(rows: List[Dict]) -> Dict:
+def aggregate(rows: List[Dict], expected_cues=None) -> Dict:
+    expected_cues = list(expected_cues or [
+        "color_lighting", "facial_action_region", "scene_context", "embedded_text"
+    ])
     all_eligible = [row for row in rows if row.get("eligible", True)]
     controls = [row for row in all_eligible if row.get("is_control", 0.0) == 1.0]
     eligible = [row for row in all_eligible if row.get("is_control", 0.0) != 1.0]
@@ -99,16 +102,23 @@ def aggregate(rows: List[Dict]) -> Dict:
         }
     unique_originals = list({row["sample_id"]: row for row in eligible}.values())
     ece = expected_calibration_error(unique_originals)
-    cue_coverage = len(by_cue) / 4.0
+    cue_coverage = len(by_cue) / len(expected_cues) if expected_cues else 0.0
     response = mean("directional_success")
     preservation = float(np.clip((mean("feature_cosine") + 1.0) / 2.0, 0.0, 1.0))
     uncertainty_rows = [row for row in eligible if row["operation"] == "insert_affect_conflict_text"]
-    uncertainty = float(np.mean([row["entropy_change"] > 0 for row in uncertainty_rows])) if uncertainty_rows else 0.0
+    text_enabled = "embedded_text" in expected_cues
+    uncertainty = (
+        float(np.mean([row["entropy_change"] > 0 for row in uncertainty_rows]))
+        if uncertainty_rows else float("nan") if not text_enabled else 0.0
+    )
     calibration = float(np.clip(1.0 - ece, 0.0, 1.0))
     vlm_rows = [row for row in eligible if row.get("vlm_valid") == 1.0]
     grounding = float(np.mean([row["vlm_cue_grounded"] for row in vlm_rows])) if vlm_rows else None
     grounding_or_coverage = grounding if grounding is not None else cue_coverage
-    cause = float(np.mean([response, preservation, grounding_or_coverage, uncertainty, calibration]))
+    cause_components = [response, preservation, grounding_or_coverage, calibration]
+    if text_enabled:
+        cause_components.append(uncertainty)
+    cause = float(np.mean(cause_components))
     paired_advantages = []
     paired_by_cue = {}
     for cue in sorted({row["cue_family"] for row in controls}):
@@ -127,7 +137,10 @@ def aggregate(rows: List[Dict]) -> Dict:
                 "positive_rate": float(np.mean(np.asarray(cue_advantages) > 0)),
             }
     folder_rows = [row for row in unique_originals if not math.isnan(row.get("original_folder_correct", float("nan")))]
-    result = {"n_pairs": len(eligible), "n_control_pairs": len(controls), "cue_coverage": cue_coverage, "directional_success_rate": response, "emotion_js_divergence_mean": mean("emotion_js_divergence"), "va_distance_mean": mean("va_distance"), "feature_cosine_mean": mean("feature_cosine"), "conflict_uncertainty_success_rate": uncertainty, "original_ece": ece, "original_brier_mean": float(np.mean([row["original_brier"] for row in unique_originals])), "original_nll_mean": float(np.mean([row["original_nll"] for row in unique_originals])), "original_human_plurality_accuracy": float(np.mean([row["original_correct"] for row in unique_originals])), "original_folder_accuracy": float(np.mean([row["original_folder_correct"] for row in folder_rows])) if folder_rows else float("nan"), "folder_human_agreement_rate": float(np.mean([row["folder_human_agreement"] for row in folder_rows])) if folder_rows else float("nan"), "original_va_mae": float(np.mean([0.5 * (row["original_valence_absolute_error"] + row["original_arousal_absolute_error"]) for row in unique_originals if not math.isnan(row["original_valence_absolute_error"])])), "cause_diagnostic_score": cause, "cause_note": "Unvalidated diagnostic composite: response, content preservation, cue grounding (or coverage when VLM is disabled), conflict uncertainty, calibration.", "by_cue": by_cue, "matched_control_analysis": paired_by_cue}
+    cause_note = "Unvalidated diagnostic composite: response, content preservation, cue grounding (or coverage when VLM is disabled), calibration"
+    if text_enabled:
+        cause_note += ", conflict uncertainty"
+    result = {"n_pairs": len(eligible), "n_control_pairs": len(controls), "cue_coverage": cue_coverage, "directional_success_rate": response, "emotion_js_divergence_mean": mean("emotion_js_divergence"), "va_distance_mean": mean("va_distance"), "feature_cosine_mean": mean("feature_cosine"), "conflict_uncertainty_success_rate": uncertainty, "original_ece": ece, "original_brier_mean": float(np.mean([row["original_brier"] for row in unique_originals])), "original_nll_mean": float(np.mean([row["original_nll"] for row in unique_originals])), "original_human_plurality_accuracy": float(np.mean([row["original_correct"] for row in unique_originals])), "original_folder_accuracy": float(np.mean([row["original_folder_correct"] for row in folder_rows])) if folder_rows else float("nan"), "folder_human_agreement_rate": float(np.mean([row["folder_human_agreement"] for row in folder_rows])) if folder_rows else float("nan"), "original_va_mae": float(np.mean([0.5 * (row["original_valence_absolute_error"] + row["original_arousal_absolute_error"]) for row in unique_originals if not math.isnan(row["original_valence_absolute_error"])])), "cause_diagnostic_score": cause, "cause_note": cause_note + ".", "by_cue": by_cue, "matched_control_analysis": paired_by_cue}
     if paired_advantages:
         result["target_minus_control_drop_mean"] = float(np.mean(paired_advantages))
         result["target_minus_control_drop_ci95"] = bootstrap_mean_ci(paired_advantages)
@@ -214,6 +227,6 @@ def aggregate(rows: List[Dict]) -> Dict:
                 if same_cue_control_differences else [float("nan"), float("nan")]
             ),
             "by_reported_cue": by_reported_cue,
-            "probability_note": "SmolVLM probabilities are ordinal confidence proxies; prediction flips are the primary behavioural endpoint.",
+            "probability_note": "VLM probabilities are ordinal confidence proxies; prediction flips are the primary behavioural endpoint.",
         }
     return result

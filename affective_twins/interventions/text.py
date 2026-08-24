@@ -71,21 +71,23 @@ class TextIntervention:
 
     def generate(self, image: Image.Image, image_path: Path, emotion: str) -> List[GeneratedTwin]:
         boxes = self._boxes(image_path)
-        mask = Image.new("L", image.size, 0)
-        draw = ImageDraw.Draw(mask)
-        for left, top, right, bottom, _, _ in boxes:
-            draw.rectangle((left, top, right, bottom), fill=255)
-        region = mask.getbbox()
         twins = []
-        if boxes:
+        for box_index, (left, top, right, bottom, token, confidence) in enumerate(boxes):
+            mask = Image.new("L", image.size, 0)
+            ImageDraw.Draw(mask).rectangle((left, top, right, bottom), fill=255)
             twins.append(
                 GeneratedTwin(
                     image=blurred_region(image, mask, radius=max(5.0, min(image.size) / 55.0)),
                     mask=mask,
                     cue_family=self.cue_family,
                     operation="remove_detected_text",
-                    target_region=region,
-                    metadata={"ocr_tokens": [item[4] for item in boxes], "ocr_confidences": [item[5] for item in boxes]},
+                    target_region=mask.getbbox(),
+                    metadata={
+                        "ocr_tokens": [token],
+                        "ocr_confidences": [confidence],
+                        "ocr_box_index": box_index,
+                        "text_intervention_scope": "single_reported_ocr_token_candidate",
+                    },
                 )
             )
         if self.add_conflict:

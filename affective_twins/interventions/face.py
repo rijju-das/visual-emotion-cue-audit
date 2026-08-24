@@ -18,19 +18,19 @@ LANDMARK_COMPONENTS: Dict[str, Sequence[Sequence[int]]] = {
         [70, 63, 105, 66, 107, 55, 65, 52, 53, 46],
         [336, 296, 334, 293, 300, 285, 295, 282, 283, 276],
     ],
-    "eye_AU6_7": [
+    "eye_AU5_6_7": [
         [33, 160, 158, 133, 153, 144],
         [362, 385, 387, 263, 373, 380],
     ],
-    "mouth_AU10_12_15_23_24_25_26": [
+    "mouth_AU10_12_15_20_23_24_25_26": [
         [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 308, 324, 318, 402, 317, 14, 87, 178, 88, 95],
     ],
 }
 
 AU_GROUPS: Dict[str, Sequence[str]] = {
     "brow_AU1_2_4": ["AU1", "AU2", "AU4"],
-    "eye_AU6_7": ["AU6", "AU7"],
-    "mouth_AU10_12_15_23_24_25_26": ["AU10", "AU12", "AU15", "AU23", "AU24", "AU25", "AU26"],
+    "eye_AU5_6_7": ["AU5", "AU6", "AU7"],
+    "mouth_AU10_12_15_20_23_24_25_26": ["AU10", "AU12", "AU15", "AU20", "AU23", "AU24", "AU25", "AU26"],
 }
 
 
@@ -118,8 +118,8 @@ class FaceActionRegionIntervention:
         regions = []
         fractions = {
             "brow_AU1_2_4": (0.12, 0.20, 0.88, 0.43),
-            "eye_AU6_7": (0.08, 0.30, 0.92, 0.58),
-            "mouth_AU10_12_15_23_24_25_26": (0.18, 0.58, 0.82, 0.92),
+            "eye_AU5_6_7": (0.08, 0.30, 0.92, 0.58),
+            "mouth_AU10_12_15_20_23_24_25_26": (0.18, 0.58, 0.82, 0.92),
         }
         for face_index, (x, y, width, height, confidence) in enumerate(faces):
             for group_name, (left, top, right, bottom) in fractions.items():

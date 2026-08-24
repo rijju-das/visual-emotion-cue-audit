@@ -1,6 +1,7 @@
 """Human-readable audit report and qualitative contact sheet."""
 
 from pathlib import Path
+import textwrap
 from typing import Dict, List
 
 from PIL import Image, ImageDraw, ImageFont
@@ -21,7 +22,10 @@ def make_contact_sheet(run_dir: Path, limit: int = 8) -> Path:
     samples = {row["sample_id"]: row for row in read_jsonl(run_dir / "samples.jsonl")}
     eligible = [row for row in read_jsonl(run_dir / "interventions.jsonl") if row["eligible"]]
     interventions = []
-    for cue in ["color_lighting", "facial_action_region", "scene_context", "embedded_text"]:
+    cue_order = ["color_lighting", "facial_action_region", "scene_context", "embedded_text"]
+    available_cues = [cue for cue in cue_order if any(row["cue_family"] == cue for row in eligible)]
+    per_cue = max(1, (limit + max(1, len(available_cues)) - 1) // max(1, len(available_cues)))
+    for cue in available_cues:
         cue_rows = [
             row for row in eligible
             if row["cue_family"] == cue
@@ -29,9 +33,9 @@ def make_contact_sheet(run_dir: Path, limit: int = 8) -> Path:
         ]
         if not cue_rows:
             cue_rows = [row for row in eligible if row["cue_family"] == cue]
-        interventions.extend(cue_rows[: max(1, limit // 4)])
+        interventions.extend(cue_rows[:per_cue])
     interventions = interventions[:limit]
-    panel_width, panel_height, label_height = 280, 190, 45
+    panel_width, panel_height, label_height = 280, 190, 72
     canvas = Image.new("RGB", (panel_width * 2, (panel_height + label_height) * len(interventions)), "white")
     draw = ImageDraw.Draw(canvas)
     for row_index, intervention in enumerate(interventions):
@@ -43,9 +47,23 @@ def make_contact_sheet(run_dir: Path, limit: int = 8) -> Path:
             x = column * panel_width + (panel_width - image.width) // 2
             y = row_index * (panel_height + label_height) + (panel_height - image.height) // 2
             canvas.paste(image, (x, y))
-        role = intervention.get("metadata", {}).get("report_condition_role", "")
-        label = "{} | {} | {}".format(intervention["cue_family"], role, intervention["operation"])
-        draw.text((8, row_index * (panel_height + label_height) + panel_height + 8), label, fill="black", font=_font(14))
+        metadata = intervention.get("metadata", {})
+        role = metadata.get("report_condition_role", "")
+        evidence = metadata.get("original_reported_evidence", "")
+        selected = metadata.get("selected_candidate_label", "")
+        label = "{} | {}\nreport: {} -> edit: {}".format(
+            intervention["cue_family"],
+            role,
+            textwrap.shorten(evidence, width=34, placeholder="..."),
+            textwrap.shorten(selected, width=34, placeholder="..."),
+        )
+        draw.multiline_text(
+            (8, row_index * (panel_height + label_height) + panel_height + 6),
+            label,
+            fill="black",
+            font=_font(13),
+            spacing=4,
+        )
     path = run_dir / "contact_sheet.png"
     canvas.save(path)
     return path
@@ -74,6 +92,7 @@ def write_report(run_dir: Path, summary: Dict) -> Path:
 - Reported-cue target coverage: {coverage:.1%}
 - No reported-cue target rate: {failure:.1%}
 - Valid original-report rate: {valid_report_rate:.1%}
+- Exact evidence-grounding rate among valid reports: {grounding_rate:.1%}
 - Valid reported-cue targets: {targets}
 - Unreported-cue comparators: {comparators}
 - Original VLM-class probability drop: {drop:.3f}
@@ -90,6 +109,7 @@ The target VLM supplies both the pre-intervention report and the post-interventi
             coverage=summary.get("reported_cue_target_coverage", 0.0),
             failure=summary.get("reported_cue_audit_failure_rate", 0.0),
             valid_report_rate=summary.get("original_report_valid_rate", 0.0),
+            grounding_rate=summary.get("valid_report_exact_grounding_rate", 0.0),
             targets=faithfulness["n_reported_cue_targets"],
             comparators=faithfulness["n_unreported_cue_comparators"],
             drop=faithfulness["original_class_probability_drop_mean"],
@@ -118,6 +138,7 @@ The target VLM supplies both the pre-intervention report and the post-interventi
 ## Run summary
 
 - Samples: {n_samples}
+- Target VLM: {vlm_model}
 - Eligible pairs: {n_pairs}
 - Skipped cue/sample combinations: {n_skipped}
 - Cue coverage: {cue_coverage:.1%}

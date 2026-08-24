@@ -325,7 +325,8 @@ def test_same_vlm_grounds_reported_cue_to_candidate_region():
     assert status == "reported_cue_target"
     assert selected[0].metadata["selected_candidate_label"].startswith("person (right")
     assert selected[0].metadata["report_condition_role"] == "reported_cue_target"
-    assert selected[0].metadata["selection_model"] == "same_vlm_report_conditioned_region_selection"
+    assert selected[0].metadata["selection_model"] == "exact_reported_evidence_grounding"
+    assert selected[0].metadata["reported_evidence_region_match"]
     assert not selected[0].metadata["is_control"]
     assert selected[1].metadata["report_condition_role"] == "same_cue_matched_region_control"
     assert selected[1].metadata["is_control"]
@@ -335,6 +336,7 @@ def test_vlm_evidence_phrase_is_conditioned_on_its_emotion_and_cue_report():
     class StubVLM(SmolVLMAdapter):
         def __init__(self):
             self.questions = []
+            self.allowed_cues = ["color_lighting", "facial_action_region", "scene_context"]
 
         def _ask(self, image, question, max_new_tokens=12):
             self.questions.append(question)
@@ -354,10 +356,77 @@ def test_vlm_evidence_phrase_is_conditioned_on_its_emotion_and_cue_report():
 
     vlm = StubVLM()
     report = vlm._predict_one(Image.new("RGB", (20, 20), "yellow"))
+    cue_question = next(question for question in vlm.questions if question.startswith("Choose the strongest"))
     evidence_question = next(question for question in vlm.questions if question.startswith("You classified"))
+    assert "embedded_text" not in cue_question
     assert "joy" in evidence_question
-    assert "color_lighting" in evidence_question
+    assert "color or lighting" in evidence_question
     assert report.evidence == "bright yellow clothing"
+
+
+def test_reported_mouth_evidence_intervenes_on_mouth_not_brows():
+    class StubLocator:
+        def predict(self, images):
+            return [prediction("anger") for _ in images], None
+
+    source = Image.new("RGB", (20, 20), "white")
+    candidates = [
+        GeneratedTwin(source, Image.new("L", (20, 20), 255), CueFamily.FACE, "ablate", metadata={"au_region": region})
+        for region in ["brow_AU1_2_4", "eye_AU5_6_7", "mouth_AU10_12_15_20_23_24_25_26"]
+    ]
+    report = prediction("anger")
+    report.evidence_cue = "facial_action_region"
+    report.evidence = "mouth"
+    report.raw["parse_status"] = "valid_constrained"
+    selected, status = _report_condition_candidates(
+        None, StubLocator(), source, candidates,
+        AffectSample("sample", "unused.jpg", "anger"), report, include_control=False,
+    )
+    assert status == "reported_cue_target"
+    assert selected[0].metadata["au_region"].startswith("mouth")
+    assert selected[0].metadata["reported_evidence_matched_terms"] == ["mouth"]
+
+
+def test_unmatched_object_evidence_is_rejected_instead_of_substituted():
+    class StubLocator:
+        def predict(self, images):
+            return [prediction("disgust") for _ in images], None
+
+    source = Image.new("RGB", (20, 20), "green")
+    candidates = [
+        GeneratedTwin(source, Image.new("L", (20, 20), 255), CueFamily.COLOR, "desaturate", metadata={"panoptic_label": label})
+        for label in ["river", "boat"]
+    ]
+    report = prediction("disgust")
+    report.evidence_cue = "color_lighting"
+    report.evidence = "plastic bottles"
+    report.raw["parse_status"] = "valid_constrained"
+    selected, status = _report_condition_candidates(
+        None, StubLocator(), source, candidates,
+        AffectSample("sample", "unused.jpg", "disgust"), report, include_control=False,
+    )
+    assert selected == []
+    assert status == "reported_evidence_absent_from_candidate_labels"
+
+
+def test_vlm_region_choice_rejects_option_order_bias():
+    class FirstOptionVLM(SmolVLMAdapter):
+        def __init__(self):
+            self.model_name = "stub"
+            self.cache_dir = None
+
+        def _ask(self, image, question, max_new_tokens=12):
+            return "option_0"
+
+    result = FirstOptionVLM().select_evidence_region(
+        Image.new("RGB", (20, 20), "white"),
+        "color_lighting",
+        ["wall (left)", "person (right)"],
+        evidence="person",
+        cache_key="sample",
+    )
+    assert result["index"] is None
+    assert result["status"] == "invalid_or_order_sensitive"
 
 
 def test_reported_text_requires_ocr_grounding_in_original():
@@ -427,3 +496,35 @@ def test_report_conditioned_metrics_compare_reported_target_to_controls():
     assert faithfulness["reported_minus_unreported_drop_mean"] == pytest.approx(0.17)
     assert faithfulness["reported_minus_same_cue_control_drop_mean"] == pytest.approx(0.16)
     assert faithfulness["prediction_flip_rate"] == 1.0
+
+
+def test_three_cue_audit_does_not_penalize_absent_text_family():
+    row = {
+        "sample_id": "sample",
+        "cue_family": "color_lighting",
+        "operation": "test_edit",
+        "eligible": True,
+        "is_control": 0.0,
+        "original_confidence": 0.7,
+        "original_correct": 1.0,
+        "original_folder_correct": float("nan"),
+        "folder_human_agreement": float("nan"),
+        "original_brier": 0.1,
+        "original_nll": 0.2,
+        "original_valence_absolute_error": 0.1,
+        "original_arousal_absolute_error": 0.1,
+        "directional_success": 1.0,
+        "source_probability_drop": 0.1,
+        "emotion_js_divergence": 0.02,
+        "va_distance": 0.1,
+        "feature_cosine": 0.95,
+        "entropy_change": 0.01,
+        "report_condition_role": "unreported_cue_comparator",
+    }
+    summary = aggregate(
+        [row],
+        expected_cues=["color_lighting", "facial_action_region", "scene_context"],
+    )
+    assert summary["cue_coverage"] == pytest.approx(1 / 3)
+    assert np.isnan(summary["conflict_uncertainty_success_rate"])
+    assert "conflict uncertainty" not in summary["cause_note"]

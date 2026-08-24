@@ -1,4 +1,4 @@
-"""Constrained-choice adapter for the compact SmolVLM checkpoint."""
+"""Constrained-choice adapter for Hugging Face vision-language checkpoints."""
 
 import json
 import re
@@ -15,28 +15,100 @@ from ..schema import AffectPrediction, EMOTIONS
 PROMPT = """Inspect the image as an affective-computing auditor. Return ONLY one JSON object with keys: emotion (one of anger, disgust, fear, joy, sadness, surprise), emotion_probabilities (object over those six labels summing to 1), valence (number -1 to 1), arousal (number -1 to 1), confidence (number 0 to 1), evidence_cue (one of color_lighting, facial_action_region, scene_context, embedded_text), evidence (short visible evidence phrase), caption (one literal sentence). Do not infer a person's private internal state; describe the apparent scene affect."""
 
 EMOTION_PROMPT = "Classify the apparent emotion. Reply with exactly one word from: anger, disgust, fear, joy, sadness, surprise."
-CUE_PROMPT = "Choose the strongest visible affect cue. Reply exactly one token from: color_lighting, facial_action_region, scene_context, embedded_text."
+CUE_DESCRIPTIONS = {
+    "color_lighting": "color_lighting",
+    "facial_action_region": "facial_action_region",
+    "scene_context": "scene_context",
+    "embedded_text": "embedded_text",
+}
 VALENCE_PROMPT = "Classify apparent valence. Reply exactly one word: negative, neutral, or positive."
 AROUSAL_PROMPT = "Classify apparent arousal. Reply exactly one word: low, medium, or high."
 CONFIDENCE_PROMPT = "How confident is the visible evidence for the apparent emotion? Reply exactly one word: low, medium, or high."
-EVIDENCE_PROMPT = "You classified the apparent emotion as {emotion} and selected {cue} as the strongest cue. Name the visible evidence for that decision in at most six words. Describe only what is visible; do not infer private internal state."
+EVIDENCE_PROMPTS = {
+    "color_lighting": (
+        "You classified the apparent emotion as {emotion} and selected color or lighting as the strongest cue. "
+        "Name exactly one visible object or scene region whose colour or lighting supports that decision "
+        "(for example: person, red shirt, blue sky, dark background). Reply with only that concise region phrase; "
+        "do not reply with a colour word or emotion alone."
+    ),
+    "facial_action_region": (
+        "You classified the apparent emotion as {emotion} and selected facial evidence as the strongest cue. "
+        "Which exact facial component supplies that evidence? Reply with exactly one word: brows, eyes, or mouth."
+    ),
+    "scene_context": (
+        "You classified the apparent emotion as {emotion} and selected scene context as the strongest cue. "
+        "Name the visible background setting or surrounding scene that supports that decision in at most six words."
+    ),
+    "embedded_text": (
+        "You classified the apparent emotion as {emotion} and selected embedded text as the strongest cue. "
+        "Transcribe exactly one visible word that supports that decision. Reply with only that word."
+    ),
+}
 CAPTION_PROMPT = "Describe the visible image literally in one short sentence. Do not infer private internal states."
 
 
 class SmolVLMAdapter:
-    def __init__(self, model_name: str, local_files_only: bool = False, cache_dir: Optional[str] = None):
+    def __init__(
+        self,
+        model_name: str,
+        local_files_only: bool = False,
+        cache_dir: Optional[str] = None,
+        allowed_cues: Optional[Sequence[str]] = None,
+    ):
         try:
-            from transformers import AutoModelForImageTextToText, AutoProcessor
+            import transformers
+            from transformers import AutoProcessor
         except ImportError as error:
-            raise RuntimeError("Install the `vlm` optional dependencies before enabling SmolVLM") from error
+            raise RuntimeError("Install the `vlm` optional dependencies before enabling a VLM") from error
         self.model_name = model_name
+        self.allowed_cues = list(allowed_cues or CUE_DESCRIPTIONS)
+        unknown_cues = set(self.allowed_cues) - set(CUE_DESCRIPTIONS)
+        if not self.allowed_cues or unknown_cues:
+            raise ValueError("allowed_cues must be a non-empty subset of {}".format(sorted(CUE_DESCRIPTIONS)))
         self.cache_dir = Path(cache_dir) if cache_dir else None
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.processor = AutoProcessor.from_pretrained(model_name, local_files_only=local_files_only)
-        use_half = torch.cuda.is_available() or torch.backends.mps.is_available()
-        dtype = torch.float16 if use_half else torch.float32
-        self.model = AutoModelForImageTextToText.from_pretrained(model_name, dtype=dtype, local_files_only=local_files_only)
+        self.processor = AutoProcessor.from_pretrained(
+            model_name,
+            local_files_only=local_files_only,
+            trust_remote_code=False,
+        )
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            dtype = torch.bfloat16
+        elif torch.cuda.is_available() or torch.backends.mps.is_available():
+            dtype = torch.float16
+        else:
+            dtype = torch.float32
+        model_classes = [
+            getattr(transformers, name, None)
+            for name in ["AutoModelForImageTextToText", "AutoModelForMultimodalLM"]
+        ]
+        model_classes = [model_class for model_class in model_classes if model_class is not None]
+        if not model_classes:
+            raise RuntimeError(
+                "The installed transformers version has no image-text auto-model class. "
+                "Upgrade with `python -m pip install -U 'transformers>=5,<6'`."
+            )
+        load_errors = []
+        self.model = None
+        for model_class in model_classes:
+            try:
+                self.model = model_class.from_pretrained(
+                    model_name,
+                    dtype=dtype,
+                    local_files_only=local_files_only,
+                    trust_remote_code=False,
+                )
+                break
+            except (TypeError, ValueError, KeyError) as error:
+                load_errors.append("{}: {}".format(model_class.__name__, error))
+        if self.model is None:
+            raise RuntimeError(
+                "No installed transformers image-text auto-model could load {}. {}".format(
+                    model_name,
+                    " | ".join(load_errors),
+                )
+            )
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
         else:
@@ -64,19 +136,23 @@ class SmolVLMAdapter:
     def _predict_one(self, image: Image.Image) -> AffectPrediction:
         responses: Dict[str, str] = {}
         responses["emotion"] = self._ask(image, EMOTION_PROMPT)
-        responses["cue"] = self._ask(image, CUE_PROMPT)
+        cue_prompt = "Choose the strongest visible affect cue. Reply exactly one token from: {}.".format(
+            ", ".join(self.allowed_cues)
+        )
+        responses["cue"] = self._ask(image, cue_prompt)
         emotion = self._choice(responses["emotion"], EMOTIONS)
-        cue = self._choice(responses["cue"], ["color_lighting", "facial_action_region", "scene_context", "embedded_text"])
+        cue = self._choice(responses["cue"], self.allowed_cues)
+        evidence_prompt = EVIDENCE_PROMPTS.get(
+            cue,
+            "Name the exact visible region supporting the apparent emotion in at most six words.",
+        ).format(emotion=emotion or "an unresolved emotion")
         responses.update({
             "valence": self._ask(image, VALENCE_PROMPT),
             "arousal": self._ask(image, AROUSAL_PROMPT),
             "confidence": self._ask(image, CONFIDENCE_PROMPT),
             "evidence": self._ask(
                 image,
-                EVIDENCE_PROMPT.format(
-                    emotion=emotion or "an unresolved emotion",
-                    cue=cue or "an unresolved cue",
-                ),
+                evidence_prompt,
                 max_new_tokens=16,
             ),
             "caption": self._ask(image, CAPTION_PROMPT, max_new_tokens=32),
@@ -84,13 +160,20 @@ class SmolVLMAdapter:
         valence_word = self._choice(responses["valence"], ["negative", "neutral", "positive"])
         arousal_word = self._choice(responses["arousal"], ["low", "medium", "high"])
         confidence_word = self._choice(responses["confidence"], ["low", "medium", "high"])
-        valid = all(value is not None for value in [emotion, cue, valence_word, arousal_word, confidence_word])
+        facial_component = (
+            self._choice(responses["evidence"], ["brows", "eyes", "mouth"])
+            if cue == "facial_action_region" else None
+        )
+        evidence_valid = bool(responses["evidence"].strip()) and (
+            cue != "facial_action_region" or facial_component is not None
+        )
+        valid = all(value is not None for value in [emotion, cue, valence_word, arousal_word, confidence_word]) and evidence_valid
         emotion = emotion or "surprise"
         cue = cue or "scene_context"
         confidence = {"low": 0.38, "medium": 0.58, "high": 0.78}.get(confidence_word, 1.0 / len(EMOTIONS))
         probabilities = {label: (1.0 - confidence) / (len(EMOTIONS) - 1) for label in EMOTIONS}
         probabilities[emotion] = confidence
-        evidence = re.sub(r"\s+", " ", responses["evidence"]).strip()[:240]
+        evidence = facial_component or re.sub(r"\s+", " ", responses["evidence"]).strip()[:240]
         caption = re.sub(r"\s+", " ", responses["caption"]).strip()[:320]
         return AffectPrediction(
             emotion_probabilities=probabilities,
@@ -105,6 +188,7 @@ class SmolVLMAdapter:
                 "responses": responses,
                 "parse_status": "valid_constrained" if valid else "invalid_constrained",
                 "probability_source": "ordinal_confidence_proxy",
+                "evidence_status": "specific_region" if evidence_valid else "invalid_region",
             },
         )
 
@@ -131,26 +215,42 @@ class SmolVLMAdapter:
         cache_path = self._cache_path(selection_key)
         if cache_path and cache_path.is_file():
             return json.loads(cache_path.read_text())
-        options = "\n".join("option_{}: {}".format(index, label) for index, label in enumerate(labels))
-        prompt = (
-            "You reported {cue} as the strongest affect cue with visible evidence: {evidence}.\n"
-            "Which candidate region contains that evidence?\n{options}\n"
-            "Reply with exactly one token from option_0 through option_{last}."
-        ).format(
-            cue=cue_family,
-            evidence=evidence or "unspecified",
-            options=options,
-            last=len(labels) - 1,
-        )
-        response = self._ask(image, prompt, max_new_tokens=8)
-        match = re.search(r"\boption_(\d+)\b", response.strip().lower().replace("-", "_"))
-        index = int(match.group(1)) if match else None
-        if index is not None and not 0 <= index < len(labels):
-            index = None
+        identity = list(range(len(labels)))
+        permutations = [identity, list(reversed(identity))]
+        if len(labels) > 2:
+            permutations.append(identity[1:] + identity[:1])
+        responses = []
+        canonical_selections = []
+        for order in permutations:
+            options = "\n".join(
+                "option_{}: {}".format(option, labels[canonical])
+                for option, canonical in enumerate(order)
+            )
+            prompt = (
+                "You reported {cue} as the strongest affect cue with exact visible evidence: {evidence}.\n"
+                "Which candidate region contains that exact evidence? If none contains it, reply none.\n{options}\n"
+                "Reply with exactly one token: none, or option_0 through option_{last}."
+            ).format(
+                cue=cue_family,
+                evidence=evidence or "unspecified",
+                options=options,
+                last=len(labels) - 1,
+            )
+            response = self._ask(image, prompt, max_new_tokens=8)
+            responses.append(response)
+            match = re.search(r"\boption_(\d+)\b", response.strip().lower().replace("-", "_"))
+            option = int(match.group(1)) if match else None
+            canonical_selections.append(
+                order[option] if option is not None and 0 <= option < len(order) else None
+            )
+        index = canonical_selections[0] if len(set(canonical_selections)) == 1 else None
         result = {
             "index": index,
-            "status": "valid_constrained" if index is not None else "invalid_constrained",
-            "response": response,
+            "status": "valid_order_invariant" if index is not None else "invalid_or_order_sensitive",
+            "response": " | ".join(responses),
+            "responses": responses,
+            "canonical_selections": canonical_selections,
+            "permutations": permutations,
             "candidate_labels": labels,
         }
         if cache_path:
@@ -219,7 +319,12 @@ class SmolVLMAdapter:
         if not self.cache_dir:
             return None
         digest = hashlib.sha256(
-            (self.model_name + "|constrained-v3-report-conditioned|" + key).encode("utf-8")
+            (
+                self.model_name
+                + "|cues=" + ",".join(self.allowed_cues)
+                + "|constrained-v5-three-cue-exact-grounding|"
+                + key
+            ).encode("utf-8")
         ).hexdigest()
         return self.cache_dir / "{}.json".format(digest)
 

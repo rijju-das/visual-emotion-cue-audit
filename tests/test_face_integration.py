@@ -26,8 +26,8 @@ def test_face_localizer_finds_at_least_one_emotion6_face():
     assert found
     assert {twin.metadata["au_region"] for twin in found} >= {
         "brow_AU1_2_4",
-        "eye_AU6_7",
-        "mouth_AU10_12_15_23_24_25_26",
+        "eye_AU5_6_7",
+        "mouth_AU10_12_15_20_23_24_25_26",
     }
 
 
@@ -60,8 +60,8 @@ def test_landmark_masks_trace_separate_brows_eyes_and_mouth():
     face = [(0.5, 0.5)] * 478
     centres = {
         "brow_AU1_2_4": [(0.34, 0.34), (0.66, 0.34)],
-        "eye_AU6_7": [(0.35, 0.46), (0.65, 0.46)],
-        "mouth_AU10_12_15_23_24_25_26": [(0.50, 0.70)],
+        "eye_AU5_6_7": [(0.35, 0.46), (0.65, 0.46)],
+        "mouth_AU10_12_15_20_23_24_25_26": [(0.50, 0.70)],
     }
     for group_name, components in LANDMARK_COMPONENTS.items():
         mutable = list(face)
@@ -78,4 +78,4 @@ def test_landmark_masks_trace_separate_brows_eyes_and_mouth():
     assert all(mask.max() == 255 and mask.mean() > 0 for mask in masks.values())
     # The midpoint remains untouched: paired features are two contours, not one band.
     assert masks["brow_AU1_2_4"][54, 100] == 0
-    assert masks["eye_AU6_7"][74, 100] == 0
+    assert masks["eye_AU5_6_7"][74, 100] == 0
