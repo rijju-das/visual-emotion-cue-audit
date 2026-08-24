@@ -17,6 +17,8 @@
     "object_min_area_fraction": 0.01,
     "object_max_area_fraction": 0.65,
     "object_max_candidates": 8,
+    "superpixel_fallback": true,
+    "superpixel_count": 48,
     "face_backend": "mediapipe",
     "matched_controls": true
   },

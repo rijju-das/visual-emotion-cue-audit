@@ -23,6 +23,8 @@ class ColorIntervention:
         min_area_fraction: float = 0.01,
         max_area_fraction: float = 0.65,
         max_candidates: int = 8,
+        superpixel_fallback: bool = True,
+        superpixel_count: int = 48,
         mask_provider: Optional[Callable[[Image.Image], List[Dict]]] = None,
     ):
         # Retained for compatibility with old configs; grid cells are no longer used.
@@ -33,6 +35,8 @@ class ColorIntervention:
         self.min_area_fraction = min_area_fraction
         self.max_area_fraction = max_area_fraction
         self.max_candidates = max_candidates
+        self.superpixel_fallback = superpixel_fallback
+        self.superpixel_count = superpixel_count
         self.mask_provider = mask_provider
         self._model = None
         self._categories = None
@@ -60,9 +64,10 @@ class ColorIntervention:
 
     def _detect(self, image: Image.Image) -> List[Dict]:
         if self.mask_provider is not None:
-            return self.mask_provider(image)
+            proposals = self.mask_provider(image)
+            return proposals or self._superpixel_proposals(image)
         if not self._initialise():
-            return []
+            return self._superpixel_proposals(image)
 
         import torch
         from torchvision.transforms.functional import pil_to_tensor
@@ -80,8 +85,91 @@ class ColorIntervention:
                 "mask": mask[0].detach().cpu().numpy(),
                 "label": self._categories[label_index],
                 "score": confidence,
+                "segmenter": "torchvision_maskrcnn_resnet50_fpn_v2",
             })
-        return proposals
+        if proposals:
+            return proposals
+        return self._superpixel_proposals(image)
+
+    def _superpixel_proposals(self, image: Image.Image) -> List[Dict]:
+        """Create non-rectangular SLIC-style regions without an extra dependency."""
+        if not self.superpixel_fallback:
+            return []
+        width, height = image.size
+        scale = min(1.0, 192.0 / max(width, height))
+        work_width = max(16, int(round(width * scale)))
+        work_height = max(16, int(round(height * scale)))
+        rgb = np.asarray(
+            image.convert("RGB").resize((work_width, work_height), Image.Resampling.BILINEAR),
+            dtype=np.float32,
+        ) / 255.0
+        count = max(4, min(self.superpixel_count, work_width * work_height // 64))
+        step = max(2.0, np.sqrt(work_width * work_height / count))
+        centres = []
+        for y in np.arange(step / 2.0, work_height, step):
+            for x in np.arange(step / 2.0, work_width, step):
+                yi, xi = min(work_height - 1, int(round(y))), min(work_width - 1, int(round(x)))
+                centres.append([y, x, *rgb[yi, xi]])
+        centres = np.asarray(centres, dtype=np.float32)
+        labels = np.full((work_height, work_width), -1, dtype=np.int32)
+        yy, xx = np.mgrid[0:work_height, 0:work_width]
+        for _ in range(5):
+            distances = np.full((work_height, work_width), np.inf, dtype=np.float32)
+            for index, centre in enumerate(centres):
+                cy, cx = centre[:2]
+                y0, y1 = max(0, int(cy - 2 * step)), min(work_height, int(cy + 2 * step + 1))
+                x0, x1 = max(0, int(cx - 2 * step)), min(work_width, int(cx + 2 * step + 1))
+                colour_distance = np.square(rgb[y0:y1, x0:x1] - centre[2:]).sum(axis=2)
+                spatial_distance = (
+                    np.square((yy[y0:y1, x0:x1] - cy) / step)
+                    + np.square((xx[y0:y1, x0:x1] - cx) / step)
+                )
+                distance = colour_distance + 0.08 * spatial_distance
+                update = distance < distances[y0:y1, x0:x1]
+                distances[y0:y1, x0:x1][update] = distance[update]
+                labels[y0:y1, x0:x1][update] = index
+            for index in range(len(centres)):
+                region = labels == index
+                if region.any():
+                    centres[index, 0] = yy[region].mean()
+                    centres[index, 1] = xx[region].mean()
+                    centres[index, 2:] = rgb[region].mean(axis=0)
+
+        full_labels = np.asarray(
+            Image.fromarray(labels).resize(image.size, Image.Resampling.NEAREST), dtype=np.int32
+        )
+        centre_prior = np.exp(
+            -(
+                np.square((xx - (work_width - 1) / 2.0) / max(1.0, work_width * 0.42))
+                + np.square((yy - (work_height - 1) / 2.0) / max(1.0, work_height * 0.42))
+            )
+        )
+        global_colour = rgb.mean(axis=(0, 1))
+        proposals = []
+        for label in np.unique(labels):
+            small_region = labels == label
+            full_region = full_labels == label
+            area = float(full_region.mean())
+            if not self.min_area_fraction <= area <= self.max_area_fraction:
+                continue
+            colour_contrast = float(np.linalg.norm(rgb[small_region].mean(axis=0) - global_colour))
+            centrality = float(centre_prior[small_region].mean())
+            touches_border = bool(
+                small_region[0].any() or small_region[-1].any() or small_region[:, 0].any() or small_region[:, -1].any()
+            )
+            saliency = 0.55 * centrality + 0.45 * min(1.0, colour_contrast * 2.0)
+            if touches_border:
+                saliency *= 0.78
+            proposals.append({
+                "mask": full_region.astype(np.float32),
+                "label": "superpixel_region_{}".format(int(label)),
+                "score": max(0.01, saliency),
+                "segmenter": "numpy_slic_superpixel_fallback",
+            })
+        proposals.sort(key=lambda proposal: proposal["score"], reverse=True)
+        if proposals:
+            self.unavailable_reason = ""
+        return proposals[: self.max_candidates]
 
     @staticmethod
     def _iou(left: np.ndarray, right: np.ndarray) -> float:
@@ -112,6 +200,7 @@ class ColorIntervention:
                 "binary": binary,
                 "label": str(proposal.get("label", "object")),
                 "score": float(proposal.get("score", 1.0)),
+                "segmenter": str(proposal.get("segmenter", "provided_object_masks")),
                 "proposal_index": proposal_index,
                 "area_fraction": area_fraction,
             })
@@ -134,25 +223,27 @@ class ColorIntervention:
             subject_proposals = people
             subject_type = "all_detected_people"
         else:
-            # For non-person scenes, use one complete dominant object rather than a grid cell.
+            # For non-person scenes, use one complete dominant object or, when
+            # detection failed, the most salient boundary-following superpixel.
             primary = max(proposals, key=lambda proposal: proposal["area_fraction"] * proposal["score"])
             subject_binary = primary["binary"]
             subject_proposals = [primary]
-            subject_type = "dominant_detected_object"
+            subject_type = (
+                "salient_superpixel_region"
+                if "superpixel" in primary["segmenter"]
+                else "dominant_detected_object"
+            )
 
         subject_mask = Image.fromarray(subject_binary.astype(np.uint8) * 255, mode="L")
         background_mask = Image.fromarray((~subject_binary).astype(np.uint8) * 255, mode="L")
-        segmenter = (
-            "torchvision_maskrcnn_resnet50_fpn_v2"
-            if self.mask_provider is None
-            else "provided_object_masks"
-        )
+        segmenters = sorted({proposal["segmenter"] for proposal in subject_proposals})
         shared = {
             "subject_type": subject_type,
             "subject_labels": [proposal["label"] for proposal in subject_proposals],
             "subject_instance_count": len(subject_proposals),
             "subject_mask_area_fraction": float(subject_binary.mean()),
-            "object_segmenter": segmenter,
+            "object_segmenter": ";".join(segmenters),
+            "used_superpixel_fallback": any("superpixel" in name for name in segmenters),
             "selection_rule": "merge_all_people_else_largest_area_times_confidence",
             "is_control": False,
         }

@@ -91,6 +91,20 @@ def test_colour_intervention_merges_people_and_preserves_subject_in_background_t
     assert background_output[background_mask].mean() < array[background_mask].mean()
 
 
+def test_colour_intervention_uses_nonrectangular_superpixel_fallback():
+    yy, xx = np.mgrid[:96, :96]
+    array = np.full((96, 96, 3), 30, dtype=np.uint8)
+    array[(xx - 48) ** 2 + (yy - 48) ** 2 < 28 ** 2] = (230, 60, 30)
+    twins = ColorIntervention(mask_provider=lambda _: [], superpixel_count=36).generate(Image.fromarray(array))
+    mask = np.asarray(twins[0].mask) > 0
+    rows, columns = np.where(mask)
+    bounding_box_area = (rows.max() - rows.min() + 1) * (columns.max() - columns.min() + 1)
+    assert twins[0].metadata["used_superpixel_fallback"]
+    assert twins[0].metadata["subject_type"] == "salient_superpixel_region"
+    assert "grid_cell" not in twins[0].metadata
+    assert mask.sum() < 0.9 * bounding_box_area
+
+
 def test_context_mask_and_twin_are_well_formed():
     image = Image.new("RGB", (120, 90), (50, 120, 200))
     twins = ContextIntervention().generate(image)

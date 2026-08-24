@@ -127,6 +127,8 @@ def generate(config: Dict) -> Dict:
             min_area_fraction=float(config["run"].get("object_min_area_fraction", 0.01)),
             max_area_fraction=float(config["run"].get("object_max_area_fraction", 0.65)),
             max_candidates=int(config["run"].get("object_max_candidates", 8)),
+            superpixel_fallback=bool(config["run"].get("superpixel_fallback", True)),
+            superpixel_count=int(config["run"].get("superpixel_count", 48)),
         ),
         FaceActionRegionIntervention(
             config["assets"]["face_landmarker"],
