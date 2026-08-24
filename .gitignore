@@ -1,0 +1,21 @@
+.DS_Store
+.pytest_cache/
+__pycache__/
+*.py[cod]
+.venv/
+.cache/
+*.egg-info/
+tmp/
+logs/
+runs/
+
+# Dataset images are retained locally but must not be redistributed.
+data/*/images/
+
+# Generated LaTeX build files.
+*.aux
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz

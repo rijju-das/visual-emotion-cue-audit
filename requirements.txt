@@ -1,0 +1,10 @@
+numpy>=1.24,<3
+Pillow>=10
+torch>=2.3
+torchvision>=0.18
+mediapipe>=0.10.14,<0.11
+opencv-python>=4.9,<5
+transformers>=4.49
+accelerate>=0.30
+sentencepiece>=0.2
+pytest>=8

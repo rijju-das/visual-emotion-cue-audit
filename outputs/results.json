@@ -1,0 +1,115 @@
+{
+  "experiment": "cross-model region-specific chroma removal",
+  "dataset": "../Emotional_colorTransfer/implementation/Emotion6",
+  "class_names": [
+    "anger",
+    "disgust",
+    "fear",
+    "joy",
+    "sadness",
+    "surprise"
+  ],
+  "split_sizes": {
+    "train": 1380,
+    "validation": 198,
+    "test": 402
+  },
+  "backbone": "torchvision ResNet-18 ImageNet-1K V1, frozen",
+  "locator": {
+    "validation_macro_f1": 0.5747330188751221,
+    "test_accuracy": 0.5049751400947571,
+    "test_macro_f1": 0.49630653858184814
+  },
+  "evaluator": {
+    "validation_macro_f1": 0.5811733603477478,
+    "test_accuracy": 0.5174129605293274,
+    "test_macro_f1": 0.5124637484550476
+  },
+  "intervention": {
+    "grid_size": 4,
+    "area_fraction": 0.0625,
+    "operation": "remove chroma while preserving luminance in one grid cell",
+    "random_controls_per_image": 15,
+    "selection_model": "locator",
+    "evaluation_model": "evaluator"
+  },
+  "pilot": {
+    "n_images": 60,
+    "n_base_correct": 27,
+    "base_accuracy_on_pilot": 0.45,
+    "causal_probability_drop_mean": 0.06994876377284527,
+    "control_probability_drop_mean": -0.00127592873811308,
+    "causal_greater_than_control_rate": 0.9666666666666667,
+    "paired_drop_advantage": {
+      "mean": 0.07122469251095834,
+      "ci95_low": 0.04965864592520262,
+      "ci95_high": 0.09632703980808663
+    },
+    "paired_drop_advantage_base_correct": {
+      "mean": 0.07817039338894834,
+      "ci95_low": 0.03992319059960635,
+      "ci95_high": 0.1268481749526144
+    },
+    "causal_flip_rate": 0.18333333333333332,
+    "control_flip_rate": 0.09,
+    "causal_entropy_change_mean": 0.009582814077536266,
+    "control_entropy_change_mean": 0.0034010320901870727,
+    "causal_feature_cosine_mean": 0.974965555469195,
+    "control_feature_cosine_mean": 0.989681460460027,
+    "per_class": {
+      "anger": {
+        "n": 10,
+        "base_accuracy": 0.4,
+        "causal_probability_drop_mean": 0.07639318220317363,
+        "control_probability_drop_mean": -0.008930262510354333,
+        "paired_drop_advantage_mean": 0.08532344471352797,
+        "causal_greater_than_control_rate": 1.0
+      },
+      "disgust": {
+        "n": 10,
+        "base_accuracy": 0.8,
+        "causal_probability_drop_mean": 0.03655366003513336,
+        "control_probability_drop_mean": -0.012627765734990437,
+        "paired_drop_advantage_mean": 0.0491814257701238,
+        "causal_greater_than_control_rate": 1.0
+      },
+      "fear": {
+        "n": 10,
+        "base_accuracy": 0.5,
+        "causal_probability_drop_mean": 0.0410341314971447,
+        "control_probability_drop_mean": 0.003305164078871412,
+        "paired_drop_advantage_mean": 0.037728967418273286,
+        "causal_greater_than_control_rate": 1.0
+      },
+      "joy": {
+        "n": 10,
+        "base_accuracy": 0.2,
+        "causal_probability_drop_mean": 0.11278729774057865,
+        "control_probability_drop_mean": -0.00028996547063191993,
+        "paired_drop_advantage_mean": 0.11307726321121056,
+        "causal_greater_than_control_rate": 1.0
+      },
+      "sadness": {
+        "n": 10,
+        "base_accuracy": 0.5,
+        "causal_probability_drop_mean": 0.02891497313976288,
+        "control_probability_drop_mean": -0.002561783641576764,
+        "paired_drop_advantage_mean": 0.03147675678133964,
+        "causal_greater_than_control_rate": 0.9
+      },
+      "surprise": {
+        "n": 10,
+        "base_accuracy": 0.3,
+        "causal_probability_drop_mean": 0.12400933802127838,
+        "control_probability_drop_mean": 0.013449040850003563,
+        "paired_drop_advantage_mean": 0.11056029717127483,
+        "causal_greater_than_control_rate": 0.9
+      }
+    }
+  },
+  "limitations": [
+    "The locator and evaluator share a frozen visual backbone and training dataset.",
+    "Grid cells provide area matching but are not object-aligned regions.",
+    "Emotion6 labels represent aggregate annotations rather than a single objective affective truth."
+  ]
+}

@@ -1,0 +1,33 @@
+#!/bin/bash
+
+#SBATCH -p compute
+#SBATCH -J affect_twins_vlm
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=32000
+#SBATCH --gres=gpu:1
+#SBATCH -t 0-12:00:00
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=riju.das@ucdconnect.ie
+#SBATCH -o /home/rdas/visual-emotion-cue-audit/logs/full-vlm-%j.out
+#SBATCH -e /home/rdas/visual-emotion-cue-audit/logs/full-vlm-%j.err
+
+set -euo pipefail
+
+PROJECT_DIR=/home/rdas/visual-emotion-cue-audit
+source /home/rdas/miniconda/etc/profile.d/conda.sh
+conda activate envAU_VA
+
+export HF_HOME="$PROJECT_DIR/.cache/huggingface"
+export TORCH_HOME="$PROJECT_DIR/.cache/torch"
+export MPLCONFIGDIR="$PROJECT_DIR/.cache/matplotlib"
+export XDG_CACHE_HOME="$PROJECT_DIR/.cache"
+export TOKENIZERS_PARALLELISM=false
+
+cd "$PROJECT_DIR"
+mkdir -p logs "$HF_HOME" "$TORCH_HOME" "$MPLCONFIGDIR"
+python -m pip install -e '.[face,vlm,dev]'
+
+affective-twins doctor --config configs/emotion6_abaw80_vlm_server.json
+affective-twins generate --config configs/emotion6_abaw80_vlm_server.json
+affective-twins evaluate --config configs/emotion6_abaw80_vlm_server.json
+affective-twins report --config configs/emotion6_abaw80_vlm_server.json

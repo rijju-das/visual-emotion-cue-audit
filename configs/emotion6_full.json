@@ -1,0 +1,26 @@
+{
+  "seed": 42,
+  "dataset": {
+    "name": "Emotion6",
+    "image_root": "../Emotional_colorTransfer/implementation/Emotion6",
+    "ground_truth_csv": "../Emotional_colorTransfer/Emotion61/ground_truth.csv"
+  },
+  "run": {
+    "output_dir": "runs/emotion6_full",
+    "limit_per_class": 10,
+    "grid_size": 4,
+    "text_conflict": true,
+    "save_all_candidates": false
+  },
+  "model": {
+    "checkpoint": "checkpoints/resnet18_multitask.pt",
+    "vlm_model": "HuggingFaceTB/SmolVLM-500M-Instruct",
+    "enable_vlm": false
+  },
+  "assets": {
+    "face_landmarker": "../AU-Routing-VA/models/face_landmarker.task",
+    "face_detector_prototxt": "assets/opencv_face_detector/deploy.prototxt",
+    "face_detector_model": "assets/opencv_face_detector/res10_300x300_ssd_iter_140000_fp16.caffemodel",
+    "tesseract": "/opt/homebrew/bin/tesseract"
+  }
+}

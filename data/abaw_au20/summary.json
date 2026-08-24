@@ -1,0 +1,31 @@
+{
+  "by_au": {
+    "AU1": 6,
+    "AU10": 6,
+    "AU12": 1,
+    "AU15": 0,
+    "AU2": 3,
+    "AU23": 0,
+    "AU24": 4,
+    "AU25": 12,
+    "AU26": 3,
+    "AU4": 9,
+    "AU6": 3,
+    "AU7": 5
+  },
+  "by_emotion": {
+    "anger": 4,
+    "disgust": 3,
+    "fear": 3,
+    "joy": 4,
+    "sadness": 3,
+    "surprise": 3
+  },
+  "by_region": {
+    "brow_AU1_2_4": 14,
+    "eye_AU5_6_7": 8,
+    "mouth_AU10_12_15_20_23_24_25_26": 14
+  },
+  "manifest": "/Users/rijju/Documents/PhD_thesis/visual-emotion-cue-audit/data/abaw_au20/manifest.jsonl",
+  "n": 20
+}

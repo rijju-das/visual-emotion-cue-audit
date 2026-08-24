@@ -1,0 +1,51 @@
+\documentclass[10pt]{article}
+
+\usepackage[letterpaper,left=0.75in,right=0.75in,top=0.64in,bottom=0.64in]{geometry}
+\usepackage{graphicx}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{newtxtext,newtxmath}
+\graphicspath{{figures/}{abstract/figures/}}
+
+\pagestyle{empty}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{2.5pt}
+\setlist{nosep,leftmargin=1.25em}
+\captionsetup{font=small,labelfont=bf,skip=2pt}
+
+\begin{document}
+
+\begin{center}
+{\Large\bfseries Do Visual Emotion Models Reason with the Cues They Report? A Counterfactual Audit of Cue-Aware Affective Reasoning}
+\end{center}
+\vspace{-0.45em}
+
+\textbf{Motivation.}
+Visual emotion systems increasingly accompany categorical or dimensional predictions with saliency, cue weights, or natural-language evidence. Yet agreement with image-level annotations does not establish that these reports describe the evidence controlling the output. A system may predict sadness from dark colour or background correlations while naming a face as justification. Recent VLM benchmarks similarly report intensity-calibration errors and shallow affective descriptions~[1], but output quality alone cannot establish evidence use. We therefore ask: \emph{do the cues a model reports agree with the cues to which its prediction is behaviourally sensitive?}
+
+\textbf{Counterfactual Affective Twins.}
+We treat cue-aware affective reasoning as a testable contract: a system reports an emotion, valence--arousal, uncertainty, and the visible cue supporting its judgement. We audit that contract with controlled original--counterfactual pairs. Each ``twin'' changes one inspectable cue family---an AU-related facial region, colour and lighting, scene context, or embedded text---and records the edit mask and preserved content. A system passes only when four behaviours agree: it responds to the changed evidence, remains invariant to preserved content, grounds its report in the manipulated region, and reduces confidence when cues genuinely conflict. These tests separate \emph{cue responsiveness}, \emph{selective invariance}, \emph{evidence grounding}, and \emph{conflict calibration}, which ordinary accuracy conflates. The same protocol applies to learned cue routers and VLM-generated explanations.
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=\linewidth]{counterfactual_twins_examples.png}
+    \caption{Representative outputs from the implemented intervention generator. Quantitative evidence is reported for colour/lighting; AU-related face, context, and text pairs illustrate the full audit design pending human validation.}
+    \label{fig:framework}
+\end{figure}
+\vspace{-0.55em}
+
+\textbf{Feasibility study.}
+We first test a necessary safeguard: does an affect-sensitive intervention selected by one model transfer to an independently fitted evaluator, or merely exploit the locator? Emotion6 contains 1,980 images across six categories and retains viewer-response distributions~[2]. Using frozen ImageNet-pretrained ResNet-18 features~[3], we train two emotion heads with independent initialisation and bootstrap samples; the evaluator obtains $51.7\%$ accuracy and $0.512$ macro-F1 on the 402-image test split. For 60 balanced held-out images, the locator ranks 16 equal-area regions by the reduction in annotated-class probability after luminance-preserving chroma removal. The evaluator then assesses the selected region against all 15 area-matched controls. Selected interventions reduce annotated-class probability by $0.070$, compared with $-0.001$ for controls. The paired advantage is $0.071$ (95\% bootstrap CI $[0.050,0.096]$) and is positive for 58 of 60 images. Thus, the detected colour reliance transfers across independently fitted heads rather than remaining a locator-specific saliency artefact.
+
+\textbf{From feasibility to benchmark.}
+The executable prototype now produces twins, masks, matched controls, and intervention records for all four cue families. Human raters will next verify edit naturalness, target-cue change, and non-target preservation before the pairs are treated as perceptual counterfactuals. We will then compare a weakly supervised cue-routing predictor, conventional emotion classifiers, and VLMs. The primary analysis contrasts \emph{reported reliance}---router weights or named evidence---with \emph{behavioural reliance}, measured by target-versus-control sensitivity. This report--response alignment exposes which evidence a model uses, ignores, or merely mentions, and whether uncertainty rises under genuine cue conflict. The resulting audit connects facial behaviour, dimensional affect, scene emotion, and emotion-aware captioning through a common requirement: affective evidence should be not only reported, but independently testable.
+
+\vspace{0.1em}
+{\footnotesize\textbf{References.}
+[1] D. She et al. ``AICA-Bench: Holistically Examining the Capabilities of VLMs in Affective Image Content Analysis.'' \emph{Findings of ACL}, 2026.
+[2] K.-C. Peng et al. ``A Mixed Bag of Emotions: Model, Predict, and Transfer Emotion Distributions.'' \emph{CVPR}, 2015.
+[3] K. He et al. ``Deep Residual Learning for Image Recognition.'' \emph{CVPR}, 2016.}
+
+\end{document}

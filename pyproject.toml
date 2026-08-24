@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "counterfactual-affective-twins"
+version = "0.2.0"
+description = "Auditable counterfactual evaluation for multimodal affect models"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy>=1.24",
+  "Pillow>=10",
+  "torch>=2.3",
+  "torchvision>=0.18",
+]
+
+[project.optional-dependencies]
+face = ["mediapipe>=0.10.14,<0.11", "opencv-python>=4.9,<5"]
+vlm = ["transformers>=4.49", "accelerate>=0.30", "sentencepiece>=0.2"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+affective-twins = "affective_twins.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["affective_twins*"]
