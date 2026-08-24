@@ -7,7 +7,7 @@
     "audit_manifest": "data/audit80/manifest.jsonl"
   },
   "run": {
-    "output_dir": "runs/emotion6_abaw80_vlm_panoptic_objects_server",
+    "output_dir": "runs/emotion6_abaw80_vlm_strong_au_context_server",
     "limit_per_class": 10,
     "text_conflict": true,
     "save_all_candidates": false,
@@ -35,7 +35,7 @@
     "enable_vlm": true,
     "vlm_local_files_only": false,
     "vlm_pair_limit_per_cue": 0,
-    "vlm_cache_dir": "runs/emotion6_abaw80_vlm_panoptic_objects_server/vlm_cache"
+    "vlm_cache_dir": "runs/emotion6_abaw80_vlm_strong_au_context_server/vlm_cache"
   },
   "assets": {
     "face_landmarker": "assets/mediapipe/face_landmarker.task",

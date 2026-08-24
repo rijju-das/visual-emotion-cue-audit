@@ -21,6 +21,6 @@ export TOKENIZERS_PARALLELISM=false
 mkdir -p "$HF_HOME" "$TORCH_HOME" "$MPLCONFIGDIR"
 
 affective-twins doctor --config configs/emotion6_abaw80_vlm_subject_background_server.json
-affective-twins generate --config configs/emotion6_abaw80_vlm_subject_background_server.json
-affective-twins evaluate --config configs/emotion6_abaw80_vlm_subject_background_server.json
-affective-twins report --config configs/emotion6_abaw80_vlm_subject_background_server.json
+affective-twins generate --config configs/emotion6_abaw80_vlm_subject_background_server.json || exit 1
+affective-twins evaluate --config configs/emotion6_abaw80_vlm_subject_background_server.json || exit 1
+affective-twins report --config configs/emotion6_abaw80_vlm_subject_background_server.json || exit 1

@@ -143,17 +143,23 @@ class ColorIntervention:
             if score < self.panoptic_score_threshold or not self.panoptic_min_area_fraction <= area <= 0.90:
                 continue
             label = str(region.get("label", "object")).strip().lower()
+            label_id = int(region.get("label_id", -1))
+            is_thing = 0 <= label_id < 80
+            priority = self._label_priority(label)
+            if is_thing and priority == 50:
+                priority = 12
             regions.append({
                 "binary": mask,
                 "label": label,
                 "score": score,
                 "area_fraction": area,
                 "segmenter": "mask2former_coco_panoptic",
-                "priority": self._label_priority(label),
+                "priority": priority,
                 "segment_id": int(region.get("segment_id", region_index)),
-                "label_id": int(region.get("label_id", -1)),
+                "label_id": label_id,
                 "was_fused": bool(region.get("was_fused", False)),
                 "derived_region": False,
+                "is_thing": is_thing,
             })
         person_union = np.zeros((image.height, image.width), dtype=bool)
         for region in regions:
@@ -175,6 +181,7 @@ class ColorIntervention:
                 "label_id": -1,
                 "was_fused": False,
                 "derived_region": True,
+                "is_thing": False,
             })
         regions.sort(key=lambda region: (region["priority"], -region["area_fraction"]))
         if regions:
@@ -344,6 +351,7 @@ class ColorIntervention:
                     "panoptic_segmenter": region["segmenter"],
                     "panoptic_was_fused": region["was_fused"],
                     "derived_region": region.get("derived_region", False),
+                    "panoptic_is_thing": region.get("is_thing", False),
                     "is_complete_person_region": label == "person",
                     "mask_rectangularity": self._rectangularity(region["binary"]),
                     "is_control": False,

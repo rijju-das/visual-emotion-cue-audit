@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import numpy as np
+import pytest
 from PIL import Image, ImageDraw
 
 from affective_twins.datasets import deterministic_split, load_emotion6, load_sample_manifest
@@ -9,7 +10,8 @@ from affective_twins.interventions.context import ContextIntervention
 from affective_twins.interventions.text import TextIntervention
 from affective_twins.metrics import aggregate, bootstrap_mean_ci, js_divergence, pair_metrics
 from affective_twins.models.smolvlm import SmolVLMAdapter
-from affective_twins.schema import AffectPrediction
+from affective_twins.runner import _require_sample_images
+from affective_twins.schema import AffectPrediction, AffectSample
 
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -43,6 +45,17 @@ def test_abaw_manifest_has_20_annotation_backed_face_samples():
     assert all(sample.metadata["annotation_backed"] for sample in samples)
     assert all(sample.metadata["active_aus"] for sample in samples)
     assert all(Path(sample.image_path).is_file() for sample in samples)
+
+
+def test_generation_preflight_lists_missing_manifest_images(tmp_path):
+    samples = [
+        AffectSample("missing-a", str(tmp_path / "a.jpg"), "joy"),
+        AffectSample("missing-b", str(tmp_path / "b.jpg"), "sadness"),
+    ]
+    with pytest.raises(FileNotFoundError, match="2 missing image file") as error:
+        _require_sample_images(samples)
+    assert "a.jpg" in str(error.value)
+    assert "b.jpg" in str(error.value)
 
 
 def test_colour_intervention_preserves_unmasked_pixels_and_luminance():
@@ -157,6 +170,20 @@ def test_context_mask_and_twin_are_well_formed():
     mask = np.asarray(twins[0].mask)
     assert mask.shape == (90, 120)
     assert 0 < mask.mean() < 255
+
+
+def test_panoptic_context_preserves_foreground_and_changes_only_background():
+    array = np.zeros((90, 120, 3), dtype=np.uint8)
+    array[..., 0], array[..., 1], array[..., 2] = 40, 150, 220
+    image = Image.fromarray(array)
+    foreground = np.zeros((90, 120), dtype=np.uint8)
+    foreground[15:80, 35:85] = 255
+    twin = ContextIntervention().generate(image, Image.fromarray(foreground))[0]
+    output = np.asarray(twin.image)
+    subject = foreground > 0
+    assert np.array_equal(output[subject], array[subject])
+    assert not np.array_equal(output[~subject], array[~subject])
+    assert twin.metadata["foreground_estimator"] == "mask2former_panoptic_thing_union"
 
 
 def test_text_removal_and_conflict_with_stubbed_ocr(tmp_path):

@@ -8,7 +8,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
 
 from ..schema import CueFamily
-from .base import GeneratedTwin, blurred_region, mask_bbox
+from .base import GeneratedTwin, mask_bbox
 
 
 LANDMARK_COMPONENTS: Dict[str, Sequence[Sequence[int]]] = {
@@ -135,6 +135,7 @@ class FaceActionRegionIntervention:
         image: Image.Image,
         face: List[Tuple[float, float]],
         components: Sequence[Sequence[int]],
+        group_name: str = "",
     ) -> Image.Image:
         width, height = image.size
         mask = Image.new("L", image.size, 0)
@@ -142,11 +143,33 @@ class FaceActionRegionIntervention:
         for indices in components:
             points = [(face[index][0] * width, face[index][1] * height) for index in indices]
             draw.polygon(points, fill=255)
-        # A small dilation covers the skin/muscle immediately around each contour,
-        # while maintaining distinct left/right eyebrow and eye components.
-        dilation = max(3, int(round(min(image.size) / 120.0)) * 2 + 1)
+        face_width = (max(point[0] for point in face) - min(point[0] for point in face)) * width
+        dilation_fraction = (
+            0.055 if group_name.startswith("mouth")
+            else 0.045 if group_name.startswith("brow")
+            else 0.040
+        )
+        dilation_radius = max(2, int(round(face_width * dilation_fraction)))
+        dilation = 2 * dilation_radius + 1
         mask = mask.filter(ImageFilter.MaxFilter(dilation))
-        return mask.filter(ImageFilter.GaussianBlur(max(1.0, min(image.size) / 320.0)))
+        return mask.filter(ImageFilter.GaussianBlur(max(1.0, dilation_radius / 3.0)))
+
+    @staticmethod
+    def _strong_ablation(image: Image.Image, mask: Image.Image) -> Image.Image:
+        bbox = mask_bbox(mask)
+        if bbox is None:
+            return image.copy()
+        span = max(bbox[2] - bbox[0], bbox[3] - bbox[1])
+        blur_radius = max(7.0, span * 0.22)
+        blurred = image.convert("RGB").filter(ImageFilter.GaussianBlur(blur_radius))
+        # Pixelation suppresses residual eye/lip/brow geometry that Gaussian blur
+        # alone can preserve in low-resolution face crops.
+        width, height = image.size
+        block = max(6, int(round(span / 8.0)))
+        pixelated = blurred.resize(
+            (max(1, width // block), max(1, height // block)), Image.Resampling.BILINEAR
+        ).resize(image.size, Image.Resampling.NEAREST)
+        return Image.composite(pixelated, image.convert("RGB"), mask.convert("L"))
 
     def generate(
         self,
@@ -163,7 +186,7 @@ class FaceActionRegionIntervention:
                 (
                     face_index,
                     group_name,
-                    self._group_mask(image, face, components),
+                    self._group_mask(image, face, components, group_name),
                     "MediaPipe FaceLandmarker contours",
                     1.0,
                     len(components),
@@ -178,15 +201,15 @@ class FaceActionRegionIntervention:
             is_control = annotation_backed and not target_aus
             twins.append(
                 GeneratedTwin(
-                    image=blurred_region(image, mask, radius=max(5.0, min(image.size) / 45.0)),
+                    image=self._strong_ablation(image, mask),
                     mask=mask,
                     cue_family=self.cue_family,
                     operation=(
-                        "ablate_inactive_au_region_control"
+                        "strong_ablate_inactive_au_region_control"
                         if is_control
-                        else "ablate_annotated_au_region"
+                        else "strong_ablate_annotated_au_region"
                         if annotation_backed
-                        else "ablate_au_related_region"
+                        else "strong_ablate_au_related_region"
                     ),
                     target_region=mask_bbox(mask),
                     metadata={
@@ -199,6 +222,7 @@ class FaceActionRegionIntervention:
                         "localiser": localiser,
                         "landmark_based": self.backend != "opencv",
                         "mask_component_count": component_count,
+                        "ablation_method": "expanded_landmark_mask_strong_blur_and_pixelation",
                         "landmark_indices": [
                             index for component in LANDMARK_COMPONENTS[group_name] for index in component
                         ] if self.backend != "opencv" else [],

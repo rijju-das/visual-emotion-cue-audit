@@ -6,7 +6,7 @@ import numpy as np
 from PIL import Image, ImageFilter
 
 from ..schema import CueFamily
-from .base import GeneratedTwin, blurred_region, luminance_preserving_desaturate, mask_bbox
+from .base import GeneratedTwin, luminance_preserving_desaturate, mask_bbox
 
 
 class ContextIntervention:
@@ -27,10 +27,18 @@ class ContextIntervention:
         context = 255 - np.asarray(foreground_image, dtype=np.uint8)
         return Image.fromarray(context, mode="L")
 
-    def generate(self, image: Image.Image) -> List[GeneratedTwin]:
-        mask = self.context_mask(image)
+    def generate(self, image: Image.Image, foreground_mask: Image.Image = None) -> List[GeneratedTwin]:
+        if foreground_mask is not None and foreground_mask.getbbox() is not None:
+            foreground = np.asarray(foreground_mask.convert("L"), dtype=np.uint8)
+            mask = Image.fromarray(255 - foreground, mode="L")
+            estimator = "mask2former_panoptic_thing_union"
+        else:
+            mask = self.context_mask(image)
+            estimator = "edge_plus_centre_prior_fallback"
         desaturated = luminance_preserving_desaturate(image, mask)
-        blurred = blurred_region(desaturated, mask, radius=max(5.0, min(image.size) / 50.0))
+        blur_radius = max(5.0, min(image.size) / 50.0)
+        blurred_background = desaturated.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+        blurred = Image.composite(blurred_background, image.convert("RGB"), mask.convert("L"))
         return [
             GeneratedTwin(
                 image=blurred,
@@ -38,7 +46,10 @@ class ContextIntervention:
                 cue_family=self.cue_family,
                 operation="background_chroma_and_detail_attenuation",
                 target_region=mask_bbox(mask),
-                metadata={"foreground_estimator": "edge_plus_centre_prior"},
+                metadata={
+                    "foreground_estimator": estimator,
+                    "foreground_preserved": foreground_mask is not None,
+                    "context_operation": "desaturate_and_blur_background_only",
+                },
             )
         ]
-

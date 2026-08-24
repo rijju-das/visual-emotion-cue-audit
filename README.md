@@ -5,8 +5,8 @@ An end-to-end, standalone framework for auditing whether affect models respond t
 The framework creates matched twins that alter one cue family at a time:
 
 - `color_lighting`: two explicit Mask R-CNN twins—luminance-preserving chroma removal over the complete subject (all people merged) and background-only exposure reduction;
-- `facial_action_region`: landmark-contoured eyebrow, eye, or mouth evidence ablation, linked only to annotation-supported AUs;
-- `scene_context`: subject-preserving background chroma/detail attenuation;
+- `facial_action_region`: expanded landmark-contoured eyebrow, eye, or mouth masks with strong blur/pixelation, linked only to annotation-supported AUs;
+- `scene_context`: panoptic-foreground-preserving background chroma/detail attenuation;
 - `embedded_text`: OCR-localized text removal when text exists, plus contradictory affect-word insertion.
 
 It evaluates categorical emotion, continuous valence–arousal, response direction, probability/distribution change, uncertainty under conflict, content preservation, calibration, caption stability, and cue-evidence grounding. Every twin has a mask and a JSONL manifest entry. Ineligible cues remain in the manifest with a skip reason.
@@ -36,7 +36,7 @@ export XDG_CACHE_HOME="$PWD/.cache"
 
 Use `.venv/bin/affective-twins all --config configs/emotion6_abaw80_vlm_server.json` after a checkpoint exists to run generation, evaluation, and reporting together. The GPU workflow is also available in `jobs/full_vlm_gpu.job`.
 
-The strengthened panoptic-object and landmark run uses `configs/emotion6_abaw80_vlm_subject_background_server.json`; `jobs/full_vlm_gpu.job` is already configured for it. It writes to `runs/emotion6_abaw80_vlm_panoptic_objects_server/`, leaving earlier runs untouched. Mask2Former COCO panoptic segmentation produces one separately retained mask per object or background surface, with labels such as `person`, `wall-*`, `floor-*`, and a derived `dark-background`; the locator scores these candidates but cannot collapse them into a local patch. SegFormer and Mask R-CNN provide semantic and complete-object fallbacks. Connected superpixels are disabled in the main server configuration. If all object-aware localizers fail, the colour cue is marked ineligible rather than using a grid patch. Mask2Former requires SciPy and downloads an approximately 276 MB checkpoint on its first run.
+The strengthened panoptic-object, AU, and context run uses `configs/emotion6_abaw80_vlm_subject_background_server.json`; `jobs/full_vlm_gpu.job` is already configured for it. It writes to `runs/emotion6_abaw80_vlm_strong_au_context_server/`, leaving earlier runs untouched. Mask2Former COCO panoptic segmentation produces one separately retained mask per object or background surface, with labels such as `person`, `wall-*`, `floor-*`, and a derived `dark-background`; the locator scores these candidates but cannot collapse them into a local patch. All annotation-active AU groups are retained and strongly ablated with expanded landmark masks, while at most one inactive AU region is retained as a control. Context intervention preserves the union of detected panoptic objects exactly and desaturates/blurs only its background complement. SegFormer and Mask R-CNN provide semantic and complete-object fallbacks. Connected superpixels are disabled in the main server configuration. If all object-aware localizers fail, the colour cue is marked ineligible rather than using a grid patch. Mask2Former requires SciPy and downloads an approximately 276 MB checkpoint on its first run.
 
 ## Outputs
 

@@ -45,6 +45,18 @@ def load_audit_samples(config: Dict) -> List[AffectSample]:
     return samples
 
 
+def _require_sample_images(samples: List[AffectSample]) -> None:
+    missing = [Path(sample.image_path) for sample in samples if not Path(sample.image_path).is_file()]
+    if missing:
+        preview = "\n".join("  - {}".format(path) for path in missing[:20])
+        remainder = "\n  ... and {} more".format(len(missing) - 20) if len(missing) > 20 else ""
+        raise FileNotFoundError(
+            "Audit manifest references {} missing image file(s):\n{}{}\n"
+            "Restore data/audit80/images from the licensed dataset copy before running generation."
+            .format(len(missing), preview, remainder)
+        )
+
+
 def _select(locator: ResNetAffectModel, source: Image.Image, candidates, emotion: str, include_control: bool = False):
     if not candidates:
         return []
@@ -111,12 +123,55 @@ def _score_without_discarding(locator: ResNetAffectModel, source: Image.Image, c
     return candidates
 
 
+def _retain_face_regions(
+    locator: ResNetAffectModel,
+    source: Image.Image,
+    candidates,
+    emotion: str,
+    include_control: bool = False,
+):
+    """Retain every annotation-active AU group and at most one inactive control."""
+    if not candidates:
+        return []
+    predictions, _ = locator.predict([source] + [candidate.image for candidate in candidates])
+    base = predictions[0].emotion_probabilities[emotion]
+    drops = [base - prediction.emotion_probabilities[emotion] for prediction in predictions[1:]]
+    target_indices = [
+        index for index, candidate in enumerate(candidates)
+        if not candidate.metadata.get("is_control", False)
+    ]
+    for index in target_indices:
+        candidates[index].metadata.update({
+            "candidate_count": len(candidates),
+            "selection_model": "retain_all_annotation_active_au_regions",
+            "locator_source_probability_drop": float(drops[index]),
+        })
+    result = [candidates[index] for index in target_indices]
+    controls = [
+        index for index, candidate in enumerate(candidates)
+        if candidate.metadata.get("is_control", False)
+    ]
+    if include_control and controls:
+        control_index = min(controls, key=lambda index: abs(drops[index]))
+        candidates[control_index].operation = "matched_region_control"
+        candidates[control_index].expected_direction = "control"
+        candidates[control_index].metadata.update({
+            "is_control": True,
+            "control_for_regions": [candidates[index].metadata.get("au_region") for index in target_indices],
+            "locator_source_probability_drop": float(drops[control_index]),
+            "selection_model": "single_inactive_au_region_control",
+        })
+        result.append(candidates[control_index])
+    return result
+
+
 def generate(config: Dict) -> Dict:
     output_dir = Path(config["run"]["output_dir"])
     checkpoint = Path(config["model"]["checkpoint"])
     if not checkpoint.exists():
         raise FileNotFoundError("Missing model checkpoint. Run `affective-twins train` first.")
     samples = load_audit_samples(config)
+    _require_sample_images(samples)
     locator = ResNetAffectModel(checkpoint, role="locator")
     generators = [
         ColorIntervention(
@@ -156,6 +211,7 @@ def generate(config: Dict) -> Dict:
     for sample in samples:
         with Image.open(sample.image_path) as source_file:
             source = source_file.convert("RGB")
+        context_foreground_mask = None
         for generator in generators:
             allowed_cues = sample.metadata.get("allowed_cues")
             if allowed_cues and generator.cue_family.value not in allowed_cues:
@@ -168,12 +224,26 @@ def generate(config: Dict) -> Dict:
                     active_aus=sample.metadata.get("active_aus", []),
                     trusted_face_crop=bool(sample.metadata.get("trusted_face_crop", False)),
                 )
+            elif generator.cue_family == CueFamily.CONTEXT:
+                candidates = generator.generate(source, foreground_mask=context_foreground_mask)
             else:
                 candidates = generator.generate(source)
             if generator.cue_family == CueFamily.COLOR:
                 candidates = _score_without_discarding(locator, source, candidates, sample.emotion)
+                foreground_candidates = [
+                    candidate for candidate in candidates
+                    if candidate.metadata.get("panoptic_is_thing", False)
+                    or candidate.metadata.get("semantic_label") == "person"
+                    or candidate.metadata.get("intervention_scope") == "complete_subject"
+                ]
+                if foreground_candidates:
+                    union = np.logical_or.reduce([
+                        np.asarray(candidate.mask.convert("L")) > 0
+                        for candidate in foreground_candidates
+                    ])
+                    context_foreground_mask = Image.fromarray(union.astype(np.uint8) * 255, mode="L")
             elif generator.cue_family == CueFamily.FACE:
-                candidates = _select(
+                candidates = _retain_face_regions(
                     locator,
                     source,
                     candidates,
@@ -383,6 +453,13 @@ def doctor(config: Dict) -> Dict:
         checks["audit_manifest"] = Path(config["dataset"]["audit_manifest"]).is_file()
         checks["dataset"] = checks["audit_manifest"]
         checks["ground_truth"] = True
+        if checks["audit_manifest"]:
+            audit_samples = load_sample_manifest(Path(config["dataset"]["audit_manifest"]))
+            missing_images = [sample.image_path for sample in audit_samples if not Path(sample.image_path).is_file()]
+            checks["audit_images_present"] = not missing_images
+            checks["audit_image_count"] = len(audit_samples)
+            checks["missing_audit_image_count"] = len(missing_images)
+            checks["missing_audit_images"] = missing_images[:20]
     try:
         import mediapipe  # noqa: F401
         checks["mediapipe"] = True

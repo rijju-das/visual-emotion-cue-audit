@@ -47,6 +47,12 @@ def test_au_annotated_face_targets_only_active_regions_and_marks_controls():
     assert targets[0].metadata["target_active_aus"] == ["AU1"]
     assert controls
     assert all(not twin.metadata["target_active_aus"] for twin in controls)
+    with Image.open(path) as source:
+        original = np.asarray(source.convert("RGB"))
+    target_output = np.asarray(targets[0].image)
+    target_mask = np.asarray(targets[0].mask) > 0
+    assert np.abs(target_output.astype(float)[target_mask] - original.astype(float)[target_mask]).mean() > 3.0
+    assert targets[0].metadata["ablation_method"] == "expanded_landmark_mask_strong_blur_and_pixelation"
 
 
 def test_landmark_masks_trace_separate_brows_eyes_and_mouth():
