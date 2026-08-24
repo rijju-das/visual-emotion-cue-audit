@@ -6,7 +6,7 @@ import numpy as np
 from PIL import Image
 
 from ..schema import CueFamily
-from .base import GeneratedTwin, luminance_preserving_desaturate, mask_bbox
+from .base import GeneratedTwin, attenuate_illumination, luminance_preserving_desaturate, mask_bbox
 
 
 class ColorIntervention:
@@ -120,28 +120,64 @@ class ColorIntervention:
         return accepted
 
     def generate(self, image: Image.Image) -> List[GeneratedTwin]:
-        twins = []
-        for instance_id, proposal in enumerate(self._object_masks(image)):
-            mask = Image.fromarray(proposal["binary"].astype(np.uint8) * 255, mode="L")
-            twins.append(
-                GeneratedTwin(
-                    image=luminance_preserving_desaturate(image, mask),
-                    mask=mask,
-                    cue_family=self.cue_family,
-                    operation="object_chroma_removal",
-                    target_region=mask_bbox(mask),
-                    metadata={
-                        "object_instance_id": instance_id,
-                        "object_label": proposal["label"],
-                        "object_score": proposal["score"],
-                        "object_mask_area_fraction": proposal["area_fraction"],
-                        "object_segmenter": "torchvision_maskrcnn_resnet50_fpn_v2"
-                        if self.mask_provider is None
-                        else "provided_object_masks",
-                        "proposal_index": proposal["proposal_index"],
-                    },
-                )
-            )
+        proposals = self._object_masks(image)
+        if not proposals:
+            if not self.unavailable_reason:
+                self.unavailable_reason = "no_object_instance_detected"
+            return []
+
+        people = [proposal for proposal in proposals if proposal["label"].lower() == "person"]
+        if people:
+            # Merge every detected person instance so no person is reduced to a face
+            # or torso patch and visible arms, hands, legs, and feet remain included.
+            subject_binary = np.logical_or.reduce([proposal["binary"] for proposal in people])
+            subject_proposals = people
+            subject_type = "all_detected_people"
+        else:
+            # For non-person scenes, use one complete dominant object rather than a grid cell.
+            primary = max(proposals, key=lambda proposal: proposal["area_fraction"] * proposal["score"])
+            subject_binary = primary["binary"]
+            subject_proposals = [primary]
+            subject_type = "dominant_detected_object"
+
+        subject_mask = Image.fromarray(subject_binary.astype(np.uint8) * 255, mode="L")
+        background_mask = Image.fromarray((~subject_binary).astype(np.uint8) * 255, mode="L")
+        segmenter = (
+            "torchvision_maskrcnn_resnet50_fpn_v2"
+            if self.mask_provider is None
+            else "provided_object_masks"
+        )
+        shared = {
+            "subject_type": subject_type,
+            "subject_labels": [proposal["label"] for proposal in subject_proposals],
+            "subject_instance_count": len(subject_proposals),
+            "subject_mask_area_fraction": float(subject_binary.mean()),
+            "object_segmenter": segmenter,
+            "selection_rule": "merge_all_people_else_largest_area_times_confidence",
+            "is_control": False,
+        }
+        twins = [
+            GeneratedTwin(
+                image=luminance_preserving_desaturate(image, subject_mask),
+                mask=subject_mask,
+                cue_family=self.cue_family,
+                operation="complete_subject_chroma_removal",
+                target_region=mask_bbox(subject_mask),
+                metadata={**shared, "intervention_scope": "complete_subject"},
+            ),
+            GeneratedTwin(
+                image=attenuate_illumination(image, background_mask, exposure=0.65),
+                mask=background_mask,
+                cue_family=self.cue_family,
+                operation="background_exposure_reduction",
+                target_region=mask_bbox(background_mask),
+                metadata={
+                    **shared,
+                    "intervention_scope": "background_illumination",
+                    "exposure_multiplier_linear_rgb": 0.65,
+                },
+            ),
+        ]
         if not twins and not self.unavailable_reason:
             self.unavailable_reason = "no_object_instance_detected"
         return twins

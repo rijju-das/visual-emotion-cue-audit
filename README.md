@@ -4,7 +4,7 @@ An end-to-end, standalone framework for auditing whether affect models respond t
 
 The framework creates matched twins that alter one cue family at a time:
 
-- `color_lighting`: independently selected, luminance-preserving chroma removal over a complete Mask R-CNN object instance;
+- `color_lighting`: two explicit Mask R-CNN twins—luminance-preserving chroma removal over the complete subject (all people merged) and background-only exposure reduction;
 - `facial_action_region`: landmark-contoured eyebrow, eye, or mouth evidence ablation, linked only to annotation-supported AUs;
 - `scene_context`: subject-preserving background chroma/detail attenuation;
 - `embedded_text`: OCR-localized text removal when text exists, plus contradictory affect-word insertion.
@@ -36,7 +36,7 @@ export XDG_CACHE_HOME="$PWD/.cache"
 
 Use `.venv/bin/affective-twins all --config configs/emotion6_abaw80_vlm_server.json` after a checkpoint exists to run generation, evaluation, and reporting together. The GPU workflow is also available in `jobs/full_vlm_gpu.job`.
 
-The strengthened object/landmark run uses `configs/emotion6_abaw80_vlm_object_landmark_server.json`; `jobs/full_vlm_gpu.job` is already configured for it. It writes to `runs/emotion6_abaw80_vlm_object_landmark_server/`, leaving the verified earlier run untouched. Mask R-CNN weights are downloaded into `.cache/torch` on the first server run.
+The strengthened subject/background and landmark run uses `configs/emotion6_abaw80_vlm_subject_background_server.json`; `jobs/full_vlm_gpu.job` is already configured for it. It writes to `runs/emotion6_abaw80_vlm_subject_background_server/`, leaving both earlier runs untouched. Each eligible colour image retains both the complete-subject and background-light twins rather than selecting only one. Mask R-CNN weights are downloaded into `.cache/torch` on the first server run.
 
 ## Outputs
 

@@ -52,16 +52,43 @@ def test_colour_intervention_preserves_unmasked_pixels_and_luminance():
     irregular_object = np.zeros((80, 80), dtype=np.float32)
     irregular_object[10:55, 12:42] = 1.0
     irregular_object[42:70, 30:65] = 1.0
-    twin = ColorIntervention(
+    twins = ColorIntervention(
         mask_provider=lambda _: [{"mask": irregular_object, "label": "chair", "score": 0.98}]
-    ).generate(image)[0]
+    ).generate(image)
+    twin = twins[0]
     output, mask = np.asarray(twin.image), np.asarray(twin.mask) > 0
-    assert twin.operation == "object_chroma_removal"
-    assert twin.metadata["object_label"] == "chair"
+    assert [item.operation for item in twins] == [
+        "complete_subject_chroma_removal",
+        "background_exposure_reduction",
+    ]
+    assert twin.metadata["subject_labels"] == ["chair"]
     assert np.array_equal(output[~mask], array[~mask])
     before = 0.2126 * array[..., 0] + 0.7152 * array[..., 1] + 0.0722 * array[..., 2]
     after = 0.2126 * output[..., 0] + 0.7152 * output[..., 1] + 0.0722 * output[..., 2]
     assert np.abs(before[mask] - after[mask]).mean() < 1.0
+
+
+def test_colour_intervention_merges_people_and_preserves_subject_in_background_twin():
+    array = np.full((80, 100, 3), (180, 120, 60), dtype=np.uint8)
+    image = Image.fromarray(array)
+    left_person = np.zeros((80, 100), dtype=np.float32)
+    right_person = np.zeros((80, 100), dtype=np.float32)
+    left_person[8:76, 8:32] = 1.0
+    right_person[15:75, 65:92] = 1.0
+    twins = ColorIntervention(mask_provider=lambda _: [
+        {"mask": left_person, "label": "person", "score": 0.99},
+        {"mask": right_person, "label": "person", "score": 0.97},
+    ]).generate(image)
+    subject_mask = np.asarray(twins[0].mask) > 0
+    background_mask = np.asarray(twins[1].mask) > 0
+    expected_subject = np.logical_or(left_person > 0, right_person > 0)
+    assert np.array_equal(subject_mask, expected_subject)
+    assert np.array_equal(background_mask, ~expected_subject)
+    assert twins[0].metadata["subject_type"] == "all_detected_people"
+    assert twins[0].metadata["subject_instance_count"] == 2
+    background_output = np.asarray(twins[1].image)
+    assert np.array_equal(background_output[subject_mask], array[subject_mask])
+    assert background_output[background_mask].mean() < array[background_mask].mean()
 
 
 def test_context_mask_and_twin_are_well_formed():

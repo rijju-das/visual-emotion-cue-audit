@@ -96,6 +96,21 @@ def _select(locator: ResNetAffectModel, source: Image.Image, candidates, emotion
     return result
 
 
+def _score_without_discarding(locator: ResNetAffectModel, source: Image.Image, candidates, emotion: str):
+    """Record locator sensitivity while retaining each distinct intervention scope."""
+    if not candidates:
+        return []
+    predictions, _ = locator.predict([source] + [candidate.image for candidate in candidates])
+    base = predictions[0].emotion_probabilities[emotion]
+    for candidate, prediction in zip(candidates, predictions[1:]):
+        candidate.metadata.update({
+            "candidate_count": len(candidates),
+            "selection_model": "predefined_semantic_scope",
+            "locator_source_probability_drop": float(base - prediction.emotion_probabilities[emotion]),
+        })
+    return candidates
+
+
 def generate(config: Dict) -> Dict:
     output_dir = Path(config["run"]["output_dir"])
     checkpoint = Path(config["model"]["checkpoint"])
@@ -142,7 +157,9 @@ def generate(config: Dict) -> Dict:
                 )
             else:
                 candidates = generator.generate(source)
-            if generator.cue_family in (CueFamily.COLOR, CueFamily.FACE):
+            if generator.cue_family == CueFamily.COLOR:
+                candidates = _score_without_discarding(locator, source, candidates, sample.emotion)
+            elif generator.cue_family == CueFamily.FACE:
                 candidates = _select(
                     locator,
                     source,
