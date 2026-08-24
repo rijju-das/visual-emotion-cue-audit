@@ -11,21 +11,27 @@ from ..schema import CueFamily
 from .base import GeneratedTwin, blurred_region, mask_bbox
 
 
-LANDMARK_GROUPS: Dict[str, Sequence[int]] = {
-    "brow_AU1_2_4": [46, 53, 52, 65, 55, 285, 295, 282, 283, 276],
-    "eye_AU5_6_7": [33, 160, 158, 133, 153, 144, 362, 385, 387, 263, 373, 380],
-    "mouth_AU12_15_20_25_26": [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 0, 13, 14],
+LANDMARK_COMPONENTS: Dict[str, Sequence[Sequence[int]]] = {
+    # Separate polygons preserve the two eyebrows and two eyes instead of
+    # replacing the entire horizontal facial band between them.
+    "brow_AU1_2_4": [
+        [70, 63, 105, 66, 107, 55, 65, 52, 53, 46],
+        [336, 296, 334, 293, 300, 285, 295, 282, 283, 276],
+    ],
+    "eye_AU6_7": [
+        [33, 160, 158, 133, 153, 144],
+        [362, 385, 387, 263, 373, 380],
+    ],
+    "mouth_AU10_12_15_23_24_25_26": [
+        [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 308, 324, 318, 402, 317, 14, 87, 178, 88, 95],
+    ],
 }
 
 AU_GROUPS: Dict[str, Sequence[str]] = {
     "brow_AU1_2_4": ["AU1", "AU2", "AU4"],
-    "eye_AU5_6_7": ["AU6", "AU7"],
-    "mouth_AU10_12_15_20_23_24_25_26": ["AU10", "AU12", "AU15", "AU23", "AU24", "AU25", "AU26"],
+    "eye_AU6_7": ["AU6", "AU7"],
+    "mouth_AU10_12_15_23_24_25_26": ["AU10", "AU12", "AU15", "AU23", "AU24", "AU25", "AU26"],
 }
-
-# MediaPipe indices for the same three regions. AU5 and AU20 are not present in
-# the Aff-Wild2 12-AU annotation protocol and are therefore not claimed here.
-LANDMARK_GROUPS["mouth_AU10_12_15_20_23_24_25_26"] = LANDMARK_GROUPS.pop("mouth_AU12_15_20_25_26")
 
 
 class FaceActionRegionIntervention:
@@ -112,8 +118,8 @@ class FaceActionRegionIntervention:
         regions = []
         fractions = {
             "brow_AU1_2_4": (0.12, 0.20, 0.88, 0.43),
-            "eye_AU5_6_7": (0.08, 0.30, 0.92, 0.58),
-            "mouth_AU10_12_15_20_23_24_25_26": (0.18, 0.58, 0.82, 0.92),
+            "eye_AU6_7": (0.08, 0.30, 0.92, 0.58),
+            "mouth_AU10_12_15_23_24_25_26": (0.18, 0.58, 0.82, 0.92),
         }
         for face_index, (x, y, width, height, confidence) in enumerate(faces):
             for group_name, (left, top, right, bottom) in fractions.items():
@@ -121,20 +127,26 @@ class FaceActionRegionIntervention:
                 mask = Image.new("L", image.size, 0)
                 ImageDraw.Draw(mask).ellipse(box, fill=255)
                 mask = mask.filter(ImageFilter.GaussianBlur(max(2.0, min(image.size) / 160.0)))
-                regions.append((face_index, group_name, mask, "OpenCV ResNet-SSD face + HOG person verification + anatomical fractions", confidence))
+                regions.append((face_index, group_name, mask, "OpenCV approximate anatomical fallback", confidence, 1))
         return regions
 
     @staticmethod
-    def _group_mask(image: Image.Image, face: List[Tuple[float, float]], indices: Sequence[int]) -> Image.Image:
+    def _group_mask(
+        image: Image.Image,
+        face: List[Tuple[float, float]],
+        components: Sequence[Sequence[int]],
+    ) -> Image.Image:
         width, height = image.size
-        points = [(face[index][0] * width, face[index][1] * height) for index in indices]
-        xs, ys = zip(*points)
-        padding_x = max(4, int((max(xs) - min(xs)) * 0.18))
-        padding_y = max(4, int((max(ys) - min(ys)) * 0.35))
-        box = (min(xs) - padding_x, min(ys) - padding_y, max(xs) + padding_x, max(ys) + padding_y)
         mask = Image.new("L", image.size, 0)
-        ImageDraw.Draw(mask).ellipse(box, fill=255)
-        return mask.filter(ImageFilter.GaussianBlur(max(2.0, min(image.size) / 160.0)))
+        draw = ImageDraw.Draw(mask)
+        for indices in components:
+            points = [(face[index][0] * width, face[index][1] * height) for index in indices]
+            draw.polygon(points, fill=255)
+        # A small dilation covers the skin/muscle immediately around each contour,
+        # while maintaining distinct left/right eyebrow and eye components.
+        dilation = max(3, int(round(min(image.size) / 120.0)) * 2 + 1)
+        mask = mask.filter(ImageFilter.MaxFilter(dilation))
+        return mask.filter(ImageFilter.GaussianBlur(max(1.0, min(image.size) / 320.0)))
 
     def generate(
         self,
@@ -148,12 +160,19 @@ class FaceActionRegionIntervention:
         else:
             faces = self._detect(image)
             regions = [
-                (face_index, group_name, self._group_mask(image, face, indices), "MediaPipe FaceMesh", 1.0)
+                (
+                    face_index,
+                    group_name,
+                    self._group_mask(image, face, components),
+                    "MediaPipe FaceLandmarker contours",
+                    1.0,
+                    len(components),
+                )
                 for face_index, face in enumerate(faces)
-                for group_name, indices in LANDMARK_GROUPS.items()
+                for group_name, components in LANDMARK_COMPONENTS.items()
             ]
         twins = []
-        for face_index, group_name, mask, localiser, confidence in regions:
+        for face_index, group_name, mask, localiser, confidence, component_count in regions:
             target_aus = sorted(set(AU_GROUPS[group_name]) & set(active_aus))
             annotation_backed = bool(active_aus)
             is_control = annotation_backed and not target_aus
@@ -178,6 +197,11 @@ class FaceActionRegionIntervention:
                         "au_annotation_backed": annotation_backed,
                         "is_control": is_control,
                         "localiser": localiser,
+                        "landmark_based": self.backend != "opencv",
+                        "mask_component_count": component_count,
+                        "landmark_indices": [
+                            index for component in LANDMARK_COMPONENTS[group_name] for index in component
+                        ] if self.backend != "opencv" else [],
                         "face_confidence": confidence,
                         "trusted_face_crop": trusted_face_crop,
                     },

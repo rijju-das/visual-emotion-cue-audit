@@ -49,8 +49,15 @@ def test_colour_intervention_preserves_unmasked_pixels_and_luminance():
     array = np.zeros((80, 80, 3), dtype=np.uint8)
     array[..., 0], array[..., 1], array[..., 2] = 220, 80, 30
     image = Image.fromarray(array)
-    twin = ColorIntervention(4).generate(image)[0]
+    irregular_object = np.zeros((80, 80), dtype=np.float32)
+    irregular_object[10:55, 12:42] = 1.0
+    irregular_object[42:70, 30:65] = 1.0
+    twin = ColorIntervention(
+        mask_provider=lambda _: [{"mask": irregular_object, "label": "chair", "score": 0.98}]
+    ).generate(image)[0]
     output, mask = np.asarray(twin.image), np.asarray(twin.mask) > 0
+    assert twin.operation == "object_chroma_removal"
+    assert twin.metadata["object_label"] == "chair"
     assert np.array_equal(output[~mask], array[~mask])
     before = 0.2126 * array[..., 0] + 0.7152 * array[..., 1] + 0.0722 * array[..., 2]
     after = 0.2126 * output[..., 0] + 0.7152 * output[..., 1] + 0.0722 * output[..., 2]

@@ -67,14 +67,20 @@ def _select(locator: ResNetAffectModel, source: Image.Image, candidates, emotion
         if explicit_controls:
             control_index = min(explicit_controls, key=lambda index: abs(drops[index]))
         elif candidates[selected].cue_family == CueFamily.COLOR:
-            grid_size = int(candidates[selected].metadata.get("grid_size", 4))
-            selected_row, selected_column = divmod(int(candidates[selected].metadata["grid_cell"]), grid_size)
             remaining = [index for index in range(len(candidates)) if index != selected]
-            control_index = max(
+            selected_area = float(candidates[selected].metadata.get("object_mask_area_fraction", 0.0))
+            control_index = min(
                 remaining,
-                key=lambda index: abs(divmod(index, grid_size)[0] - selected_row) + abs(divmod(index, grid_size)[1] - selected_column),
-            )
-            candidates[control_index].metadata["is_control"] = True
+                key=lambda index: abs(
+                    float(candidates[index].metadata.get("object_mask_area_fraction", 0.0)) - selected_area
+                ),
+            ) if remaining else None
+            if control_index is not None:
+                candidates[control_index].metadata.update({
+                    "is_control": True,
+                    "control_matching": "nearest_object_mask_area",
+                    "target_object_mask_area_fraction": selected_area,
+                })
         else:
             control_index = None
         if control_index is not None:
@@ -98,7 +104,15 @@ def generate(config: Dict) -> Dict:
     samples = load_audit_samples(config)
     locator = ResNetAffectModel(checkpoint, role="locator")
     generators = [
-        ColorIntervention(int(config["run"].get("grid_size", 4))),
+        ColorIntervention(
+            int(config["run"].get("grid_size", 4)),
+            backend=config["run"].get("color_backend", "maskrcnn"),
+            score_threshold=float(config["run"].get("object_score_threshold", 0.65)),
+            mask_threshold=float(config["run"].get("object_mask_threshold", 0.5)),
+            min_area_fraction=float(config["run"].get("object_min_area_fraction", 0.01)),
+            max_area_fraction=float(config["run"].get("object_max_area_fraction", 0.65)),
+            max_candidates=int(config["run"].get("object_max_candidates", 8)),
+        ),
         FaceActionRegionIntervention(
             config["assets"]["face_landmarker"],
             backend=config["run"].get("face_backend", "auto"),
@@ -178,7 +192,7 @@ def generate(config: Dict) -> Dict:
     )
     skipped = Counter(row["cue_family"] for row in intervention_rows if not row["eligible"])
     provenance = {
-        "framework_version": "0.2.0",
+        "framework_version": "0.3.0",
         "python": sys.version,
         "platform": platform.platform(),
         "torch": torch.__version__,
@@ -349,4 +363,9 @@ def doctor(config: Dict) -> Dict:
         checks["transformers"] = True
     except ImportError:
         checks["transformers"] = False
+    try:
+        import torchvision  # noqa: F401
+        checks["torchvision_object_segmenter"] = True
+    except ImportError:
+        checks["torchvision_object_segmenter"] = False
     return checks

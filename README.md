@@ -4,8 +4,8 @@ An end-to-end, standalone framework for auditing whether affect models respond t
 
 The framework creates matched twins that alter one cue family at a time:
 
-- `color_lighting`: independently selected, luminance-preserving local chroma removal;
-- `facial_action_region`: brow, eye, or mouth evidence ablation in a verified human face region;
+- `color_lighting`: independently selected, luminance-preserving chroma removal over a complete Mask R-CNN object instance;
+- `facial_action_region`: landmark-contoured eyebrow, eye, or mouth evidence ablation, linked only to annotation-supported AUs;
 - `scene_context`: subject-preserving background chroma/detail attenuation;
 - `embedded_text`: OCR-localized text removal when text exists, plus contradictory affect-word insertion.
 
@@ -34,11 +34,13 @@ export XDG_CACHE_HOME="$PWD/.cache"
 .venv/bin/affective-twins report
 ```
 
-Use `.venv/bin/affective-twins all` after a checkpoint exists to run generation, evaluation, and reporting together. Configuration is in `configs/emotion6_full.json`.
+Use `.venv/bin/affective-twins all --config configs/emotion6_abaw80_vlm_server.json` after a checkpoint exists to run generation, evaluation, and reporting together. The GPU workflow is also available in `jobs/full_vlm_gpu.job`.
+
+The strengthened object/landmark run uses `configs/emotion6_abaw80_vlm_object_landmark_server.json`; `jobs/full_vlm_gpu.job` is already configured for it. It writes to `runs/emotion6_abaw80_vlm_object_landmark_server/`, leaving the verified earlier run untouched. Mask R-CNN weights are downloaded into `.cache/torch` on the first server run.
 
 ## Outputs
 
-The verified run is in `runs/emotion6_full/`:
+The verified GPU run is in `runs/emotion6_abaw80_vlm_server/`:
 
 - `samples.jsonl` and `interventions.jsonl`: reproducible source/twin manifests;
 - `twins/` and `masks/`: cue-separated image pairs and exact edit masks;
@@ -51,28 +53,29 @@ After annotators complete the template, summarize it with:
 
 ```bash
 .venv/bin/affective-twins human-summary \
-  --annotations runs/emotion6_full/human_validation_template.csv
+  --config configs/emotion6_abaw80_vlm_server.json \
+  --annotations runs/emotion6_abaw80_vlm_server/human_validation_template.csv
 ```
 
-## Verified classifier/VA run
+## Verified earlier GPU audit
 
-The deterministic seed-42 run uses 60 balanced held-out Emotion6 images. The independent evaluator has 51.7% test accuracy and 0.326 VA MAE on the normalized `[-1, 1]` scale. It evaluates 181 eligible twins:
+The deterministic seed-42 run uses 80 images: 60 balanced Emotion6 examples and 20 Aff-Wild2 frames with frame-level Action Unit labels. It evaluates 201 target twins and 76 matched controls. Confidence intervals are 95% bootstrap intervals.
 
-| Cue | Eligible pairs | Directional success | Mean source-probability drop | Feature cosine |
+| Cue | Target pairs | Directional success | Mean source-probability drop | Feature cosine |
 |---|---:|---:|---:|---:|
 | Colour/lighting | 60 | 95.0% | 0.070 | 0.975 |
 | Scene context | 60 | 60.0% | 0.015 | 0.941 |
-| Embedded-text conflict | 60 | 45.0% uncertainty increase | 0.029 | 0.974 |
-| Facial action region | 1 | 100.0% | 0.070 | 0.982 |
+| Embedded-text conflict | 60 | 53.3% uncertainty increase | 0.001 | 0.993 |
+| Facial action region | 21 | 61.9% | -0.005 | 0.951 |
 
-The face result has `n=1` and is not a general performance claim. Fifty-nine images lacked a verified human face. This conservative eligibility decision was introduced after visual QA found animal-face false positives in weaker detectors.
+The matched-control analysis supports selective colour sensitivity: the mean target-minus-control probability drop is 0.075 (95% CI [0.050, 0.104]) and is positive for 58 of 60 images. The AU-region result is mixed. Its target-minus-control difference is -0.047 (95% CI [-0.127, 0.013]), so the present facial ablations do not establish selective AU reliance. Fifty-nine non-face Emotion6 images remain explicitly ineligible rather than being forced through a face intervention.
 
 ## VLM status
 
-`SmolVLMAdapter` implements the complete VLM contract: discrete emotion probabilities, VA, confidence, cue identification, visible evidence, and a literal caption. The 500M default checkpoint was smoke-tested, but it returned free text rather than the requested JSON. The adapter records this explicitly as `fallback_free_text` and assigns conservative confidence. Therefore `enable_vlm` remains `false` for the reported benchmark; enable it only after the selected VLM passes `scripts/smoke_vlm.py` with `parse_status: valid_json`.
+`SmolVLMAdapter` implements constrained reporting of discrete emotion, valence--arousal, confidence, cue identification, visible evidence, and a literal caption. The full run evaluates all 201 target pairs. Of these, 188 pairs have valid constrained outputs (93.5%); invalid outputs are retained and excluded from VLM-specific aggregates rather than silently repaired. Cue-grounding accuracy is 35.1% (95% CI [28.7%, 42.0%]), and mean original--twin caption Jaccard similarity is 0.416. These results measure the behaviour of the 500M checkpoint and should not be generalized to VLMs as a class.
 
 ## Interpretation boundary
 
-This is a complete executable research framework, not proof of perceptual causality. Current face edits ablate AU-related anatomical regions; they do not synthesize exact muscle activations. Context masks use a deterministic saliency prior rather than semantic segmentation. Human validation remains required before reporting the twins as perception-preserving causal interventions. The CAUSE composite in `summary.json` is explicitly unvalidated and should be treated as a run diagnostic, not a leaderboard score.
+This is a complete executable research framework, not proof of perceptual causality. Current face edits precisely localize AU-related facial components, but still ablate visual evidence rather than synthesizing exact muscle activations. Object masks are limited to the instance categories recognized by the pretrained detector, and samples with no qualifying object are explicitly skipped. Context masks use a deterministic saliency prior rather than semantic segmentation. Human validation remains required before reporting the twins as perception-preserving causal interventions. The CAUSE composite in `summary.json` is explicitly unvalidated and should be treated as a run diagnostic, not a leaderboard score.
 
 The original colour-only pilot and anonymous one-page PDF remain in `outputs/`, `abstract/`, and `submission/` for provenance.
