@@ -23,8 +23,13 @@ class ColorIntervention:
         min_area_fraction: float = 0.01,
         max_area_fraction: float = 0.65,
         max_candidates: int = 8,
-        superpixel_fallback: bool = True,
+        superpixel_fallback: bool = False,
         superpixel_count: int = 48,
+        panoptic_model: str = "facebook/mask2former-swin-small-coco-panoptic",
+        panoptic_score_threshold: float = 0.55,
+        panoptic_min_area_fraction: float = 0.03,
+        panoptic_local_files_only: bool = False,
+        panoptic_provider: Optional[Callable[[Image.Image], List[Dict]]] = None,
         semantic_model: str = "nvidia/segformer-b0-finetuned-ade-512-512",
         semantic_score_threshold: float = 0.45,
         semantic_local_files_only: bool = False,
@@ -41,6 +46,11 @@ class ColorIntervention:
         self.max_candidates = max_candidates
         self.superpixel_fallback = superpixel_fallback
         self.superpixel_count = superpixel_count
+        self.panoptic_model_name = panoptic_model
+        self.panoptic_score_threshold = panoptic_score_threshold
+        self.panoptic_min_area_fraction = panoptic_min_area_fraction
+        self.panoptic_local_files_only = panoptic_local_files_only
+        self.panoptic_provider = panoptic_provider
         self.semantic_model_name = semantic_model
         self.semantic_score_threshold = semantic_score_threshold
         self.semantic_local_files_only = semantic_local_files_only
@@ -52,7 +62,124 @@ class ColorIntervention:
         self._semantic_processor = None
         self._semantic_model = None
         self._semantic_device = None
+        self._panoptic_processor = None
+        self._panoptic_model = None
+        self._panoptic_device = None
         self.unavailable_reason = ""
+
+    @staticmethod
+    def _label_priority(label: str) -> int:
+        label = label.lower()
+        ordered = ["person", "wall", "floor", "ceiling", "door", "window", "building", "road", "sky", "earth", "grass"]
+        return next((index for index, name in enumerate(ordered) if name in label), 50)
+
+    def _initialise_panoptic(self) -> bool:
+        if self.panoptic_provider is not None or self._panoptic_model is not None:
+            return True
+        try:
+            import torch
+            from transformers import AutoImageProcessor, Mask2FormerForUniversalSegmentation
+
+            self._panoptic_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self._panoptic_processor = AutoImageProcessor.from_pretrained(
+                self.panoptic_model_name,
+                local_files_only=self.panoptic_local_files_only,
+            )
+            self._panoptic_model = Mask2FormerForUniversalSegmentation.from_pretrained(
+                self.panoptic_model_name,
+                local_files_only=self.panoptic_local_files_only,
+            ).to(self._panoptic_device).eval()
+            return True
+        except (ImportError, OSError, RuntimeError, ValueError) as error:
+            self.unavailable_reason = "panoptic_segmenter_unavailable:{}".format(type(error).__name__)
+            return False
+
+    def _panoptic_regions(self, image: Image.Image) -> List[Dict]:
+        if self.panoptic_provider is not None:
+            raw_regions = self.panoptic_provider(image)
+        else:
+            if not self._initialise_panoptic():
+                return []
+            import torch
+
+            inputs = self._panoptic_processor(images=image.convert("RGB"), return_tensors="pt")
+            inputs = {name: value.to(self._panoptic_device) for name, value in inputs.items()}
+            with torch.inference_mode():
+                outputs = self._panoptic_model(**inputs)
+            processed = self._panoptic_processor.post_process_panoptic_segmentation(
+                outputs,
+                threshold=self.panoptic_score_threshold,
+                mask_threshold=0.5,
+                overlap_mask_area_threshold=0.8,
+                label_ids_to_fuse=set(),
+                target_sizes=[(image.height, image.width)],
+            )[0]
+            segmentation = processed["segmentation"].detach().cpu().numpy()
+            raw_regions = []
+            for segment in processed["segments_info"]:
+                label_id = int(segment["label_id"])
+                raw_regions.append({
+                    "mask": segmentation == int(segment["id"]),
+                    "label": str(self._panoptic_model.config.id2label.get(label_id, label_id)),
+                    "score": float(segment.get("score", 1.0)),
+                    "segment_id": int(segment["id"]),
+                    "label_id": label_id,
+                    "was_fused": bool(segment.get("was_fused", False)),
+                })
+
+        regions = []
+        for region_index, region in enumerate(raw_regions):
+            raw_mask = region["mask"]
+            if isinstance(raw_mask, Image.Image):
+                mask = np.asarray(raw_mask.resize(image.size, Image.Resampling.NEAREST)) > 0
+            else:
+                mask = np.asarray(raw_mask).squeeze().astype(bool)
+                if mask.shape != (image.height, image.width):
+                    mask = np.asarray(
+                        Image.fromarray(mask).resize(image.size, Image.Resampling.NEAREST)
+                    ).astype(bool)
+            area = float(mask.mean())
+            score = float(region.get("score", 1.0))
+            if score < self.panoptic_score_threshold or not self.panoptic_min_area_fraction <= area <= 0.90:
+                continue
+            label = str(region.get("label", "object")).strip().lower()
+            regions.append({
+                "binary": mask,
+                "label": label,
+                "score": score,
+                "area_fraction": area,
+                "segmenter": "mask2former_coco_panoptic",
+                "priority": self._label_priority(label),
+                "segment_id": int(region.get("segment_id", region_index)),
+                "label_id": int(region.get("label_id", -1)),
+                "was_fused": bool(region.get("was_fused", False)),
+                "derived_region": False,
+            })
+        person_union = np.zeros((image.height, image.width), dtype=bool)
+        for region in regions:
+            if "person" in region["label"]:
+                person_union |= region["binary"]
+        luminance = np.asarray(image.convert("L"), dtype=np.float32) / 255.0
+        dark_threshold = min(0.30, float(np.quantile(luminance, 0.28)))
+        dark_background = (luminance <= dark_threshold) & ~person_union
+        dark_area = float(dark_background.mean())
+        if self.panoptic_min_area_fraction <= dark_area <= 0.65:
+            regions.append({
+                "binary": dark_background,
+                "label": "dark-background",
+                "score": 1.0,
+                "area_fraction": dark_area,
+                "segmenter": "mask2former_panoptic_plus_luminance",
+                "priority": 11,
+                "segment_id": -1,
+                "label_id": -1,
+                "was_fused": False,
+                "derived_region": True,
+            })
+        regions.sort(key=lambda region: (region["priority"], -region["area_fraction"]))
+        if regions:
+            self.unavailable_reason = ""
+        return regions[: self.max_candidates]
 
     def _initialise_semantic(self) -> bool:
         if self.semantic_provider is not None or self._semantic_model is not None:
@@ -190,6 +317,35 @@ class ColorIntervention:
                     "semantic_mask_area_fraction": region["area_fraction"],
                     "semantic_segmenter": region["segmenter"],
                     "is_complete_person_region": label == "person",
+                    "is_control": False,
+                },
+            ))
+        return twins
+
+    def _panoptic_twins(self, image: Image.Image, regions: List[Dict]) -> List[GeneratedTwin]:
+        twins = []
+        for region_index, region in enumerate(regions):
+            mask = Image.fromarray(region["binary"].astype(np.uint8) * 255, mode="L")
+            label = region["label"]
+            twins.append(GeneratedTwin(
+                image=luminance_preserving_desaturate(image, mask),
+                mask=mask,
+                cue_family=self.cue_family,
+                operation="panoptic_entity_chroma_removal",
+                target_region=mask_bbox(mask),
+                metadata={
+                    "intervention_scope": "complete_panoptic_entity",
+                    "panoptic_region_index": region_index,
+                    "panoptic_segment_id": region["segment_id"],
+                    "panoptic_label_id": region["label_id"],
+                    "panoptic_label": label,
+                    "panoptic_score": region["score"],
+                    "panoptic_mask_area_fraction": region["area_fraction"],
+                    "panoptic_segmenter": region["segmenter"],
+                    "panoptic_was_fused": region["was_fused"],
+                    "derived_region": region.get("derived_region", False),
+                    "is_complete_person_region": label == "person",
+                    "mask_rectangularity": self._rectangularity(region["binary"]),
                     "is_control": False,
                 },
             ))
@@ -418,8 +574,16 @@ class ColorIntervention:
         return accepted
 
     def generate(self, image: Image.Image) -> List[GeneratedTwin]:
-        # Injected instance-mask providers are used by isolated tests. Normal runs
-        # first seek named scene entities such as person, wall, and floor.
+        # Normal runs first retain every detected panoptic object/surface as a
+        # separate counterfactual candidate. Injected providers isolate unit tests.
+        skip_panoptic = (
+            self.panoptic_provider is None
+            and (self.mask_provider is not None or self.semantic_provider is not None)
+        )
+        panoptic_regions = [] if skip_panoptic else self._panoptic_regions(image)
+        if panoptic_regions:
+            return self._panoptic_twins(image, panoptic_regions)
+
         semantic_regions = [] if self.mask_provider is not None and self.semantic_provider is None else self._semantic_regions(image)
         if semantic_regions:
             return self._semantic_twins(image, semantic_regions)

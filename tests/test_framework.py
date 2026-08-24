@@ -96,7 +96,9 @@ def test_colour_intervention_uses_nonrectangular_superpixel_fallback():
     yy, xx = np.mgrid[:96, :96]
     array = np.full((96, 96, 3), 30, dtype=np.uint8)
     array[(xx - 48) ** 2 + (yy - 48) ** 2 < 28 ** 2] = (230, 60, 30)
-    twins = ColorIntervention(mask_provider=lambda _: [], superpixel_count=36).generate(Image.fromarray(array))
+    twins = ColorIntervention(
+        mask_provider=lambda _: [], superpixel_fallback=True, superpixel_count=36
+    ).generate(Image.fromarray(array))
     mask = np.asarray(twins[0].mask) > 0
     rows, columns = np.where(mask)
     bounding_box_area = (rows.max() - rows.min() + 1) * (columns.max() - columns.min() + 1)
@@ -126,6 +128,26 @@ def test_colour_intervention_keeps_person_wall_and_floor_as_separate_entities():
     assert np.array_equal(np.asarray(by_label["person"].mask) > 0, person)
     assert by_label["person"].metadata["is_complete_person_region"]
     assert "grid_cell" not in by_label["wall"].metadata
+
+
+def test_panoptic_colour_intervention_keeps_each_scene_entity():
+    image = Image.new("RGB", (100, 80), (120, 120, 120))
+    yy, xx = np.mgrid[:80, :100]
+    person = ((xx - 50) / 15) ** 2 + ((yy - 42) / 30) ** 2 <= 1.0
+    wall = (yy < 52) & ~person
+    floor = (yy >= 52) & ~person
+    generator = ColorIntervention(panoptic_provider=lambda _: [
+        {"mask": person, "label": "person", "score": 0.99, "segment_id": 7, "label_id": 0},
+        {"mask": wall, "label": "wall-other", "score": 0.97, "segment_id": 8, "label_id": 116},
+        {"mask": floor, "label": "floor-wood", "score": 0.96, "segment_id": 9, "label_id": 104},
+    ])
+    twins = generator.generate(image)
+    by_label = {twin.metadata["panoptic_label"]: twin for twin in twins}
+    assert set(by_label) == {"person", "wall-other", "floor-wood"}
+    assert all(twin.operation == "panoptic_entity_chroma_removal" for twin in twins)
+    assert np.array_equal(np.asarray(by_label["person"].mask) > 0, person)
+    assert by_label["person"].metadata["panoptic_segment_id"] == 7
+    assert by_label["wall-other"].metadata["intervention_scope"] == "complete_panoptic_entity"
 
 
 def test_context_mask_and_twin_are_well_formed():

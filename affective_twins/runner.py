@@ -127,8 +127,14 @@ def generate(config: Dict) -> Dict:
             min_area_fraction=float(config["run"].get("object_min_area_fraction", 0.01)),
             max_area_fraction=float(config["run"].get("object_max_area_fraction", 0.65)),
             max_candidates=int(config["run"].get("object_max_candidates", 8)),
-            superpixel_fallback=bool(config["run"].get("superpixel_fallback", True)),
+            superpixel_fallback=bool(config["run"].get("superpixel_fallback", False)),
             superpixel_count=int(config["run"].get("superpixel_count", 48)),
+            panoptic_model=config["model"].get(
+                "panoptic_model", "facebook/mask2former-swin-small-coco-panoptic"
+            ),
+            panoptic_score_threshold=float(config["run"].get("panoptic_score_threshold", 0.55)),
+            panoptic_min_area_fraction=float(config["run"].get("panoptic_min_area_fraction", 0.03)),
+            panoptic_local_files_only=bool(config["model"].get("panoptic_local_files_only", False)),
             semantic_model=config["model"].get(
                 "semantic_model", "nvidia/segformer-b0-finetuned-ade-512-512"
             ),
@@ -392,4 +398,9 @@ def doctor(config: Dict) -> Dict:
         checks["torchvision_object_segmenter"] = True
     except ImportError:
         checks["torchvision_object_segmenter"] = False
+    try:
+        import scipy  # noqa: F401
+        checks["scipy_panoptic_dependency"] = True
+    except ImportError:
+        checks["scipy_panoptic_dependency"] = False
     return checks
