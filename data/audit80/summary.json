@@ -1,6 +1,32 @@
 {
   "abaw_au": 20,
   "emotion6": 60,
-  "manifest": "/Users/rijju/Documents/PhD_thesis/visual-emotion-cue-audit/data/audit80/manifest.jsonl",
-  "n": 80
+  "emotion6_by_folder_label": {
+    "anger": 9,
+    "disgust": 10,
+    "fear": 11,
+    "joy": 10,
+    "sadness": 11,
+    "surprise": 9
+  },
+  "emotion6_by_human_plurality": {
+    "anger": 10,
+    "disgust": 10,
+    "fear": 10,
+    "joy": 10,
+    "sadness": 10,
+    "surprise": 10
+  },
+  "folder_human_agreement_count": 58,
+  "manifest": "data/audit80/manifest.jsonl",
+  "minimum_selected_probability_by_emotion": {
+    "anger": 0.455556,
+    "disgust": 0.7,
+    "fear": 0.7,
+    "joy": 0.833333,
+    "sadness": 0.888889,
+    "surprise": 0.5
+  },
+  "n": 80,
+  "selection": "top_10_unique_human_plurality_probability_per_emotion"
 }

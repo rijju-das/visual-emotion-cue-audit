@@ -40,7 +40,18 @@ class SampleDataset(Dataset):
             image = self.transform(source.convert("RGB"))
         va = [sample.valence if sample.valence is not None else 0.0, sample.arousal if sample.arousal is not None else 0.0]
         valid = float(sample.valence is not None and sample.arousal is not None)
-        return image, EMOTIONS.index(sample.emotion), torch.tensor(va), valid
+        emotion_target = torch.tensor(
+            [float(sample.emotion_distribution.get(label, 0.0)) for label in EMOTIONS],
+            dtype=torch.float32,
+        )
+        if float(emotion_target.sum()) <= 0:
+            emotion_target = torch.tensor(
+                [float(label == sample.emotion) for label in EMOTIONS],
+                dtype=torch.float32,
+            )
+        else:
+            emotion_target = emotion_target / emotion_target.sum()
+        return image, emotion_target, torch.tensor(va), valid
 
 
 def _device():
@@ -72,6 +83,7 @@ def _extract(backbone, samples, transform, batch_size, device):
 
 def _macro_f1(logits, labels):
     predictions = logits.argmax(1)
+    labels = labels.argmax(1) if labels.ndim == 2 else labels
     scores = []
     for index in range(len(EMOTIONS)):
         pred, truth = predictions == index, labels == index
@@ -133,12 +145,13 @@ def train_independent_models(samples: List[AffectSample], checkpoint: Path, seed
     evaluator, evaluator_score = _train_head(train_x, *train_data[1:], val_x, *val_data[1:], seed + 202)
     with torch.no_grad():
         logits, va = evaluator(test_x)
-        test_accuracy = float((logits.argmax(1) == test_data[1]).float().mean())
+        test_accuracy = float((logits.argmax(1) == test_data[1].argmax(1)).float().mean())
         valid = test_data[3]
         test_va_mae = float((va[valid] - test_data[2][valid]).abs().mean()) if valid.any() else float("nan")
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
-        "format_version": 2,
+        "format_version": 3,
+        "label_source": "human_distribution",
         "locator_head": locator.state_dict(),
         "evaluator_head": evaluator.state_dict(),
         "feature_mean": mean,
@@ -155,8 +168,11 @@ class ResNetAffectModel:
         self.device = _device()
         self.backbone, self.transform = _backbone(self.device)
         payload = torch.load(checkpoint, map_location="cpu")
-        if payload.get("format_version") != 2:
-            raise ValueError("Checkpoint lacks valence-arousal heads; run `affective-twins train` first")
+        if payload.get("format_version") != 3 or payload.get("label_source") != "human_distribution":
+            raise ValueError(
+                "Checkpoint was not trained with corrected human-distribution labels; "
+                "run `affective-twins train` again"
+            )
         self.head = MultiTaskHead()
         self.head.load_state_dict(payload["{}_head".format(role)])
         self.head.eval()

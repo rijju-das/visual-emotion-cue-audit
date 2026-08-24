@@ -13,7 +13,7 @@
     "save_all_candidates": false
   },
   "model": {
-    "checkpoint": "checkpoints/resnet18_multitask.pt",
+    "checkpoint": "checkpoints/resnet18_human_distribution_multitask.pt",
     "vlm_model": "HuggingFaceTB/SmolVLM-500M-Instruct",
     "enable_vlm": false
   },

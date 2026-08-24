@@ -63,7 +63,10 @@ This run evaluates matched original/counterfactual pairs with an evaluator indep
 - Mean VA displacement: {va_distance_mean:.3f}
 - Mean frozen-feature cosine preservation: {feature_cosine_mean:.3f}
 - Original-prediction ECE: {original_ece:.3f}
-- Original Brier score: {original_brier_mean:.3f}
+- Original Brier score against human distribution: {original_brier_mean:.3f}
+- Original accuracy against human plurality: {original_human_plurality_accuracy:.1%}
+- Original accuracy against Flickr folder label: {original_folder_accuracy:.1%}
+- Folder/human-plurality agreement: {folder_human_agreement_rate:.1%}
 - Original VA MAE: {original_va_mae:.3f}
 - Conflict uncertainty success: {conflict_uncertainty_success_rate:.1%}
 - CAUSE diagnostic score: {cause_diagnostic_score:.3f}

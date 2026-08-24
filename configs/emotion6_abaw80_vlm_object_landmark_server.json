@@ -21,7 +21,7 @@
     "matched_controls": true
   },
   "model": {
-    "checkpoint": "checkpoints/resnet18_multitask.pt",
+    "checkpoint": "checkpoints/resnet18_human_distribution_multitask.pt",
     "vlm_model": "HuggingFaceTB/SmolVLM-500M-Instruct",
     "enable_vlm": true,
     "vlm_local_files_only": false,

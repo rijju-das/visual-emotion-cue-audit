@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 EMOTIONS = ["anger", "disgust", "fear", "joy", "sadness", "surprise"]
+EMOTION6_ANNOTATION_LABELS = EMOTIONS + ["neutral"]
 
 
 class CueFamily(str, Enum):
@@ -23,6 +24,9 @@ class AffectSample:
     emotion_distribution: Dict[str, float] = field(default_factory=dict)
     valence: Optional[float] = None
     arousal: Optional[float] = None
+    nominal_emotion: Optional[str] = None
+    human_plurality_emotion: Optional[str] = None
+    human_plurality_probability: Optional[float] = None
     split: str = "unspecified"
     metadata: Dict[str, Any] = field(default_factory=dict)
 

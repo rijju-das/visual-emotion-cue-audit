@@ -4,12 +4,18 @@ import numpy as np
 import pytest
 from PIL import Image, ImageDraw
 
-from affective_twins.datasets import deterministic_split, load_emotion6, load_sample_manifest
+from affective_twins.datasets import (
+    deterministic_split,
+    high_confidence_human_subset,
+    load_emotion6,
+    load_sample_manifest,
+)
 from affective_twins.interventions.color import ColorIntervention
 from affective_twins.interventions.context import ContextIntervention
 from affective_twins.interventions.text import TextIntervention
 from affective_twins.metrics import aggregate, bootstrap_mean_ci, js_divergence, pair_metrics
 from affective_twins.models.smolvlm import SmolVLMAdapter
+from affective_twins.models.resnet import SampleDataset
 from affective_twins.runner import _require_sample_images
 from affective_twins.schema import AffectPrediction, AffectSample
 
@@ -32,10 +38,63 @@ def test_emotion6_loader_and_split():
     )
     assert len(samples) == 1980
     assert all(sample.valence is None or -1 <= sample.valence <= 1 for sample in samples)
+    by_id = {sample.sample_id: sample for sample in samples}
+    assert by_id["anger-55"].nominal_emotion == "anger"
+    assert by_id["anger-55"].human_plurality_emotion == "sadness"
+    assert by_id["anger-55"].emotion == "sadness"
+    assert by_id["anger-55"].human_plurality_probability == pytest.approx(0.8)
+    assert by_id["anger-55"].emotion_distribution["neutral"] == pytest.approx(0.0333333)
+    assert by_id["disgust-55"].human_plurality_emotion == "disgust"
+    assert by_id["disgust-55"].human_plurality_probability == pytest.approx(0.5)
     counts = {name: 0 for name in ["train", "validation", "test"]}
     for sample in deterministic_split(samples):
         counts[sample.split] += 1
-    assert counts == {"train": 1380, "validation": 198, "test": 402}
+    assert counts == {"train": 1155, "validation": 162, "test": 338}
+
+
+def test_high_confidence_audit_selection_uses_human_labels():
+    samples = load_emotion6(
+        PROJECT.parent / "Emotional_colorTransfer" / "implementation" / "Emotion6",
+        PROJECT.parent / "Emotional_colorTransfer" / "Emotion61" / "ground_truth.csv",
+    )
+    selected = high_confidence_human_subset(samples, per_class=10)
+    assert len(selected) == 60
+    assert {label: sum(sample.emotion == label for sample in selected) for label in [
+        "anger", "disgust", "fear", "joy", "sadness", "surprise"
+    ]} == {
+        "anger": 10, "disgust": 10, "fear": 10,
+        "joy": 10, "sadness": 10, "surprise": 10,
+    }
+    assert all(sample.emotion == sample.human_plurality_emotion for sample in selected)
+    assert all(sample.nominal_emotion in {
+        "anger", "disgust", "fear", "joy", "sadness", "surprise"
+    } for sample in selected)
+    assert all(sample.split == "held_out_audit" for sample in selected)
+    assert all(sample.metadata["human_plurality_margin"] > 0 for sample in selected)
+
+
+def test_resnet_training_target_uses_human_distribution(tmp_path):
+    image_path = tmp_path / "sample.jpg"
+    Image.new("RGB", (4, 4), "white").save(image_path)
+    sample = AffectSample(
+        sample_id="sample",
+        image_path=str(image_path),
+        emotion="sadness",
+        emotion_distribution={"anger": 0.1, "sadness": 0.6, "neutral": 0.3},
+    )
+    _, target, _, _ = SampleDataset([sample], lambda image: np.asarray(image))[0]
+    assert target.tolist() == pytest.approx([1 / 7, 0, 0, 0, 6 / 7, 0])
+
+
+def test_portable_audit_manifest_preserves_human_and_folder_labels():
+    samples = load_sample_manifest(PROJECT / "data" / "audit80" / "manifest.jsonl")
+    emotion6 = [sample for sample in samples if sample.metadata.get("source_dataset") == "Emotion6"]
+    assert len(samples) == 80
+    assert len(emotion6) == 60
+    assert all(sample.human_plurality_emotion == sample.emotion for sample in emotion6)
+    assert all(sample.nominal_emotion for sample in emotion6)
+    assert all("neutral" in sample.emotion_distribution for sample in emotion6)
+    assert all(Path(sample.image_path).is_file() for sample in samples)
 
 
 def test_abaw_manifest_has_20_annotation_backed_face_samples():

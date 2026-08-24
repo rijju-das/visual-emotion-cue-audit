@@ -17,16 +17,28 @@ from .io import read_jsonl, write_csv, write_json, write_jsonl
 from .human import write_annotation_template
 from .metrics import aggregate, pair_metrics
 from .models import ResNetAffectModel, SmolVLMAdapter, train_independent_models
-from .schema import AffectPrediction, AffectSample, CueFamily, Intervention
+from .schema import AffectPrediction, AffectSample, CueFamily, EMOTIONS, Intervention
 
 
 def load_samples(config: Dict) -> List[AffectSample]:
     dataset = config["dataset"]
-    return deterministic_split(load_emotion6(Path(dataset["image_root"]), Path(dataset["ground_truth_csv"])), config["seed"])
+    samples = load_emotion6(Path(dataset["image_root"]), Path(dataset["ground_truth_csv"]))
+    audit_manifest = dataset.get("audit_manifest")
+    if audit_manifest and Path(audit_manifest).is_file():
+        audit_ids = {
+            sample.sample_id for sample in load_sample_manifest(Path(audit_manifest))
+            if sample.metadata.get("source_dataset") == "Emotion6"
+        }
+        samples = [sample for sample in samples if sample.sample_id not in audit_ids]
+    return deterministic_split(samples, config["seed"])
 
 
 def train(config: Dict) -> Dict[str, float]:
-    return train_independent_models(load_samples(config), Path(config["model"]["checkpoint"]), config["seed"])
+    samples = load_samples(config)
+    metrics = train_independent_models(samples, Path(config["model"]["checkpoint"]), config["seed"])
+    metrics["training_pool_size"] = len(samples)
+    metrics["label_source"] = "human_distribution"
+    return metrics
 
 
 def load_audit_samples(config: Dict) -> List[AffectSample]:
@@ -311,6 +323,15 @@ def _prediction_from_dict(payload: Dict) -> AffectPrediction:
     return AffectPrediction(**payload)
 
 
+def _human_target_distribution(sample: AffectSample) -> Dict[str, float]:
+    """Renormalize Emotion6 annotations over the evaluator's six modeled classes."""
+    values = {label: float(sample.emotion_distribution.get(label, 0.0)) for label in EMOTIONS}
+    total = sum(values.values())
+    if total <= 0:
+        return {label: float(label == sample.emotion) for label in EMOTIONS}
+    return {label: value / total for label, value in values.items()}
+
+
 def evaluate(config: Dict) -> Dict:
     output_dir = Path(config["run"]["output_dir"])
     sample_rows = read_jsonl(output_dir / "samples.jsonl")
@@ -375,6 +396,8 @@ def evaluate(config: Dict) -> Dict:
         with Image.open(intervention["mask_path"]) as mask_file:
             mask_fraction = float(np.asarray(mask_file.convert("L"), dtype=np.float32).mean() / 255.0)
         metrics = pair_metrics(original_prediction, twin_prediction, sample.emotion, cosine, mask_fraction, intervention["expected_direction"])
+        human_target = _human_target_distribution(sample)
+        nominal_emotion = sample.nominal_emotion or sample.metadata.get("folder_label", "")
         row = {
             "sample_id": sample.sample_id,
             "intervention_id": intervention["intervention_id"],
@@ -385,13 +408,31 @@ def evaluate(config: Dict) -> Dict:
             "target_active_aus": ";".join(intervention.get("metadata", {}).get("target_active_aus", [])),
             "eligible": True,
             "source_emotion": sample.emotion,
+            "label_source": sample.metadata.get("label_source", "dataset_annotation"),
+            "human_plurality_emotion": sample.human_plurality_emotion or sample.emotion,
+            "human_plurality_probability": sample.human_plurality_probability,
+            "folder_label": nominal_emotion,
+            "folder_human_agreement": float(bool(nominal_emotion) and nominal_emotion == sample.emotion),
             "original_prediction": original_prediction.predicted_emotion,
             "twin_prediction": twin_prediction.predicted_emotion,
             "original_confidence": original_prediction.confidence,
             "twin_confidence": twin_prediction.confidence,
             "original_correct": float(original_prediction.predicted_emotion == sample.emotion),
-            "original_brier": float(sum((probability - float(label == sample.emotion)) ** 2 for label, probability in original_prediction.emotion_probabilities.items())),
-            "original_nll": float(-math.log(max(1e-12, original_prediction.emotion_probabilities[sample.emotion]))),
+            "original_folder_correct": (
+                float(original_prediction.predicted_emotion == nominal_emotion)
+                if nominal_emotion else float("nan")
+            ),
+            "original_brier": float(sum(
+                (probability - human_target[label]) ** 2
+                for label, probability in original_prediction.emotion_probabilities.items()
+            )),
+            "original_nll": float(-sum(
+                human_target[label] * math.log(max(1e-12, probability))
+                for label, probability in original_prediction.emotion_probabilities.items()
+            )),
+            "original_hard_nll": float(
+                -math.log(max(1e-12, original_prediction.emotion_probabilities[sample.emotion]))
+            ),
             "original_valence_absolute_error": abs(original_prediction.valence - sample.valence) if sample.valence is not None else float("nan"),
             "original_arousal_absolute_error": abs(original_prediction.arousal - sample.arousal) if sample.arousal is not None else float("nan"),
             "original_valence": original_prediction.valence,

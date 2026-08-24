@@ -26,7 +26,7 @@
     "matched_controls": true
   },
   "model": {
-    "checkpoint": "checkpoints/resnet18_multitask.pt",
+    "checkpoint": "checkpoints/resnet18_human_distribution_multitask.pt",
     "panoptic_model": "facebook/mask2former-swin-small-coco-panoptic",
     "panoptic_local_files_only": false,
     "semantic_model": "nvidia/segformer-b0-finetuned-ade-512-512",

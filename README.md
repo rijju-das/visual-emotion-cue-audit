@@ -15,6 +15,8 @@ It evaluates categorical emotion, continuous valence–arousal, response directi
 
 All code, environments, model assets, generated twins, masks, checkpoints, manifests, and reports are inside this folder. Existing Emotion6 annotations and the MediaPipe task file are read-only inputs referenced by the default configuration; no files are written to other thesis projects.
 
+Emotion6 targets are derived from the seven-bin human annotation distribution, not from the Flickr retrieval folder. The complete `folder/filename` key is used to join annotations, preventing collisions between repeated basenames such as `anger/55.jpg` and `sadness/55.jpg`. The six-way model excludes neutral-plurality images, trains against the human distribution renormalized over the six modeled emotions, retains the original neutral-inclusive distribution, and stores the folder label separately as `nominal_emotion`. The portable audit set contains the 10 highest unique human-plurality probabilities per modeled emotion; its minimum class-specific probabilities are recorded in `data/audit80/summary.json`. These 60 images are held out from evaluator training.
+
 ## Reproduce
 
 ```bash
@@ -27,6 +29,7 @@ export HF_HOME="$PWD/.cache/huggingface"
 export MPLCONFIGDIR="$PWD/.cache/matplotlib"
 export XDG_CACHE_HOME="$PWD/.cache"
 
+.venv/bin/python scripts/build_audit80_manifest.py
 .venv/bin/affective-twins doctor
 .venv/bin/affective-twins train
 .venv/bin/affective-twins generate
