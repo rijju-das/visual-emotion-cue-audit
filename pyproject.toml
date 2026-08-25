@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "counterfactual-affective-twins"
-version = "0.5.0"
-description = "Auditable counterfactual evaluation for multimodal affect models"
+name = "visual-emotion-cue-audit"
+version = "0.6.0"
+description = "Prospective counterfactual cue-commitment audits for visual emotion models"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [

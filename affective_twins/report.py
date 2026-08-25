@@ -9,6 +9,27 @@ from PIL import Image, ImageDraw, ImageFont
 from .io import read_jsonl
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _portable_image_path(run_dir: Path, recorded_path: str, source: bool) -> Path:
+    """Resolve server-authored absolute paths after a run is downloaded locally."""
+    recorded = Path(recorded_path)
+    if recorded.is_file():
+        return recorded
+    if source:
+        local_source = PROJECT_ROOT / "data" / "audit80" / "images" / recorded.name
+        if local_source.is_file():
+            return local_source
+    else:
+        matches = list((run_dir / "twins").glob("*/{}".format(recorded.name)))
+        if len(matches) == 1:
+            return matches[0]
+    raise FileNotFoundError(
+        "Could not resolve downloaded image path: {}".format(recorded_path)
+    )
+
+
 def _font(size: int):
     for path in ["/System/Library/Fonts/Supplemental/Arial.ttf", "/System/Library/Fonts/Supplemental/Helvetica.ttf"]:
         try:
@@ -35,11 +56,16 @@ def make_contact_sheet(run_dir: Path, limit: int = 8) -> Path:
             cue_rows = [row for row in eligible if row["cue_family"] == cue]
         interventions.extend(cue_rows[:per_cue])
     interventions = interventions[:limit]
-    panel_width, panel_height, label_height = 280, 190, 72
+    panel_width, panel_height, label_height = 280, 190, 108
     canvas = Image.new("RGB", (panel_width * 2, (panel_height + label_height) * len(interventions)), "white")
     draw = ImageDraw.Draw(canvas)
     for row_index, intervention in enumerate(interventions):
-        paths = [samples[intervention["sample_id"]]["image_path"], intervention["image_path"]]
+        paths = [
+            _portable_image_path(
+                run_dir, samples[intervention["sample_id"]]["image_path"], source=True
+            ),
+            _portable_image_path(run_dir, intervention["image_path"], source=False),
+        ]
         for column, path in enumerate(paths):
             with Image.open(path) as source:
                 image = source.convert("RGB")
@@ -51,11 +77,15 @@ def make_contact_sheet(run_dir: Path, limit: int = 8) -> Path:
         role = metadata.get("report_condition_role", "")
         evidence = metadata.get("original_reported_evidence", "")
         selected = metadata.get("selected_candidate_label", "")
-        label = "{} | {}\nreport: {} -> edit: {}".format(
+        label = "{} | {}\ncommitment: {} / {}\nreport: {} -> edit: {}\nbackup: {} ({})".format(
             intervention["cue_family"],
             role,
+            metadata.get("original_declared_cue_role", "n/a"),
+            metadata.get("original_expected_intervention_outcome", "n/a"),
             textwrap.shorten(evidence, width=34, placeholder="..."),
             textwrap.shorten(selected, width=34, placeholder="..."),
+            metadata.get("original_declared_backup_cue", "n/a"),
+            textwrap.shorten(metadata.get("original_declared_backup_evidence", ""), width=24, placeholder="..."),
         )
         draw.multiline_text(
             (8, row_index * (panel_height + label_height) + panel_height + 6),
@@ -74,7 +104,10 @@ def write_report(run_dir: Path, summary: Dict) -> Path:
     cue_rows = []
     for cue, metrics in summary.get("by_cue", {}).items():
         cue_rows.append("| {} | {} | {:.3f} | {:.3f} | {:.3f} |".format(cue, metrics["n"], metrics["directional_success_rate"], metrics["source_probability_drop_mean"], metrics["feature_cosine_mean"]))
-    faithfulness = summary.get("report_conditioned_faithfulness")
+    sensitivity = summary.get("reported_cue_behavioral_sensitivity")
+    # Backward-compatible read path for historical runs; new summaries never
+    # label behavioural consistency as explanation faithfulness.
+    faithfulness = sensitivity or summary.get("report_conditioned_faithfulness")
     if faithfulness:
         reported_cue_rows = []
         for cue, metrics in faithfulness.get("by_reported_cue", {}).items():
@@ -87,7 +120,7 @@ def write_report(run_dir: Path, summary: Dict) -> Path:
                     metrics["reported_cue_retention_rate"],
                 )
             )
-        faithfulness_section = """## Report-conditioned faithfulness
+        faithfulness_section = """## Report-conditioned behavioural sensitivity
 
 - Reported-cue target coverage: {coverage:.1%}
 - No reported-cue target rate: {failure:.1%}
@@ -104,7 +137,7 @@ def write_report(run_dir: Path, summary: Dict) -> Path:
 |---|---:|---:|---:|---:|
 {reported_cue_rows}
 
-The target VLM supplies both the pre-intervention report and the post-intervention response. Probability changes use an ordinal confidence proxy; prediction flips are the primary behavioural endpoint.
+The target VLM supplies both the pre-intervention report and the post-intervention response. This section measures behavioural consistency with its reported evidence, not access to its internal causal mechanism. Probability changes use an ordinal confidence proxy; prediction flips are the primary endpoint.
 """.format(
             coverage=summary.get("reported_cue_target_coverage", 0.0),
             failure=summary.get("reported_cue_audit_failure_rate", 0.0),
@@ -120,18 +153,76 @@ The target VLM supplies both the pre-intervention report and the post-interventi
         )
     else:
         faithfulness_section = ""
-    if summary.get("report_conditioned", False):
-        protocol_intro = (
-            "This run audits the exact cue named by the target VLM before intervention. "
-            "The stored original report selects the target region and is reused for the "
-            "same-model pre/post comparison; an independent evaluator supplies secondary diagnostics."
+    commitments = summary.get("counterfactual_cue_commitments")
+    if commitments:
+        role_rows = []
+        for role, metrics in commitments.get("by_declared_role", {}).items():
+            role_rows.append(
+                "| {} | {} | {:.1%} | {:.1%} | {:.1%} | {:.3f} |".format(
+                    role,
+                    metrics["n"],
+                    metrics["outcome_type_accuracy"],
+                    metrics["exact_commitment_accuracy"],
+                    metrics["prediction_flip_rate"],
+                    metrics["original_class_probability_drop_mean"],
+                )
+            )
+        commitment_section = """## Counterfactual cue commitments
+
+Before seeing any edited image, the VLM committed to the named cue's role, the categorical effect of attenuating it, the post-edit emotion, and a backup cue. These scores test whether those prospective claims survive the intervention.
+
+- Valid grounded commitments evaluated: {n}
+- Outcome-type forecast accuracy: {outcome:.1%}
+- Expected post-edit emotion accuracy: {emotion:.1%}
+- Exact commitment accuracy (both): {exact:.1%}
+- Full declaration coherence: {coherence:.1%}
+- Post-edit cue substitution rate: {substitution:.1%}
+- Declared-backup activation given substitution: {backup:.1%}
+- Post-edit rerationalization rate: {rerationalization:.1%}
+- Declared-backup targets grounded: {backup_targets}
+- Sequential primary+backup twins evaluated: {chains}
+- Chain incremental class drop over primary: {chain_increment:.3f}
+
+| Declared role | n | Outcome forecast | Exact commitment | Prediction flip | Class drop |
+|---|---:|---:|---:|---:|---:|
+{role_rows}
+
+The sequential twin is generated only when both the predeclared primary and backup evidence can be grounded. It tests whether removing the advertised fallback adds an effect beyond removing the primary cue alone.
+""".format(
+            n=commitments["n_valid_primary_commitments"],
+            outcome=commitments["outcome_type_accuracy"],
+            emotion=commitments["expected_emotion_accuracy"],
+            exact=commitments["exact_commitment_accuracy"],
+            coherence=commitments["full_declaration_coherence_rate"],
+            substitution=commitments["cue_substitution_rate"],
+            backup=commitments["declared_backup_activation_rate_given_substitution"],
+            rerationalization=commitments["post_edit_rerationalization_rate"],
+            backup_targets=commitments["n_declared_backup_targets"],
+            chains=commitments["n_primary_plus_backup_chains"],
+            chain_increment=commitments["chain_incremental_class_drop_over_primary_mean"],
+            role_rows="\n".join(role_rows),
         )
+    else:
+        commitment_section = ""
+    if summary.get("report_conditioned", False):
+        if summary.get("commitment_audit", False):
+            protocol_intro = (
+                "This run prospectively audits the exact cue named by the target VLM. "
+                "Before intervention, the model commits to what should happen and which backup cue "
+                "it would use; the immutable report then grounds the primary and backup twins."
+            )
+        else:
+            protocol_intro = (
+                "This run audits the exact cue named by the target VLM before intervention. "
+                "The stored original report selects the target region and is reused for the "
+                "same-model pre/post comparison; an independent evaluator supplies secondary diagnostics."
+            )
     else:
         protocol_intro = (
             "This run evaluates matched original/counterfactual pairs with an evaluator independent "
             "from the model used to select affect-sensitive colour or facial regions."
         )
-    report = """# Counterfactual Affective Twins audit
+    report = """# Counterfactual Cue Commitment audit
 
 {protocol_intro} Valence and arousal use the normalized range `[-1, 1]`.
 
@@ -152,12 +243,9 @@ The target VLM supplies both the pre-intervention report and the post-interventi
 - Original accuracy against Flickr folder label: {original_folder_accuracy:.1%}
 - Folder/human-plurality agreement: {folder_human_agreement_rate:.1%}
 - Original VA MAE: {original_va_mae:.3f}
-- Conflict uncertainty success: {conflict_uncertainty_success_rate:.1%}
-- CAUSE diagnostic score: {cause_diagnostic_score:.3f}
-
-The CAUSE value is an unvalidated diagnostic composite, not a benchmark claim.
-
 {faithfulness_section}
+
+{commitment_section}
 
 ## Results by cue
 
@@ -176,6 +264,7 @@ These results measure model sensitivity under controlled image edits. They do no
         cue_rows="\n".join(cue_rows),
         sheet_name=sheet.name,
         faithfulness_section=faithfulness_section,
+        commitment_section=commitment_section,
         protocol_intro=protocol_intro,
         **summary
     )

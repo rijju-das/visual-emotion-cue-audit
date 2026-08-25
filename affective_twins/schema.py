@@ -64,6 +64,11 @@ class AffectPrediction:
     caption: str = ""
     evidence: str = ""
     evidence_cue: str = ""
+    cue_role: str = ""
+    expected_intervention_outcome: str = ""
+    expected_emotion_after_intervention: str = ""
+    backup_cue: str = ""
+    backup_evidence: str = ""
     raw: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:

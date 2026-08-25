@@ -14,6 +14,7 @@ from PIL import Image
 
 from .datasets import balanced_subset, deterministic_split, load_emotion6, load_sample_manifest
 from .interventions import ColorIntervention, ContextIntervention, FaceActionRegionIntervention, TextIntervention
+from .interventions.base import GeneratedTwin
 from .io import read_jsonl, write_csv, write_json, write_jsonl
 from .human import write_annotation_template
 from .metrics import aggregate, pair_metrics
@@ -360,7 +361,10 @@ def _report_condition_candidates(
     if not candidates:
         return [], "no_candidates"
     candidates = _score_without_discarding(locator, source, candidates, sample.emotion)
-    valid_report = report.raw.get("parse_status") == "valid_constrained"
+    core_report_valid = report.raw.get("parse_status") == "valid_constrained"
+    commitment_required = bool(report.raw.get("commitment_required", False))
+    commitment_valid = report.raw.get("commitment_status") == "valid_commitment"
+    valid_report = core_report_valid and (not commitment_required or commitment_valid)
     reported_cue = report.evidence_cue if valid_report else ""
     cue = candidates[0].cue_family.value
     shared = {
@@ -369,9 +373,28 @@ def _report_condition_candidates(
         "original_reported_cue": reported_cue,
         "original_reported_evidence": report.evidence,
         "original_reported_emotion": report.predicted_emotion,
+        "original_commitment_valid": commitment_valid,
+        "original_declared_cue_role": report.cue_role,
+        "original_expected_intervention_outcome": report.expected_intervention_outcome,
+        "original_expected_emotion_after_intervention": report.expected_emotion_after_intervention,
+        "original_declared_backup_cue": report.backup_cue,
+        "original_declared_backup_evidence": report.backup_evidence,
     }
     if not valid_report or cue != reported_cue:
-        if candidates[0].cue_family == CueFamily.TEXT:
+        is_declared_backup = (
+            valid_report and commitment_valid and cue == report.backup_cue
+        )
+        if is_declared_backup and candidates[0].cue_family == CueFamily.TEXT:
+            eligible = [
+                index for index, candidate in enumerate(candidates)
+                if candidate.operation == "remove_detected_text"
+            ]
+        elif is_declared_backup:
+            # A declared backup is an exact-evidence target, so retain every
+            # generated region for grounding instead of applying comparator
+            # heuristics such as preferring annotation-active facial regions.
+            eligible = list(range(len(candidates)))
+        elif candidates[0].cue_family == CueFamily.TEXT:
             eligible = [index for index, candidate in enumerate(candidates) if candidate.operation == "insert_affect_conflict_text"]
         elif candidates[0].cue_family == CueFamily.FACE:
             eligible = [
@@ -383,6 +406,40 @@ def _report_condition_candidates(
                 index for index, candidate in enumerate(candidates)
                 if not candidate.metadata.get("is_control", False)
             ] or list(range(len(candidates)))
+        if is_declared_backup:
+            if not eligible:
+                return [], "declared_backup_evidence_not_available"
+            eligible_candidates = [candidates[index] for index in eligible]
+            selection = _ground_reported_evidence(
+                vlm,
+                source,
+                eligible_candidates,
+                cue,
+                report.backup_evidence,
+                "{}::declared-backup".format(sample.sample_id),
+            )
+            if selection.get("index") is None:
+                return [], "declared_backup_{}".format(
+                    selection.get("status", "evidence_not_grounded")
+                )
+            selected = eligible[int(selection["index"])]
+            candidate = candidates[selected]
+            candidate.metadata.update(shared)
+            candidate.metadata.update({
+                "is_control": False,
+                "report_match": False,
+                "reported_evidence_region_match": False,
+                "declared_backup_match": True,
+                "declared_backup_evidence_region_match": True,
+                "report_condition_role": "declared_backup_cue_target",
+                "selection_model": "exact_declared_backup_evidence_grounding",
+                "selected_candidate_label": _candidate_label(candidate),
+                "backup_evidence_matched_terms": selection.get("matched_terms", []),
+                "backup_region_selection_status": selection["status"],
+                "backup_region_selection_response": selection["response"],
+                "backup_region_candidates": selection["candidate_labels"],
+            })
+            return [candidate], "declared_backup_cue_target"
         selected = eligible[0]
         candidate = candidates[selected]
         candidate.metadata.update(shared)
@@ -390,6 +447,7 @@ def _report_condition_candidates(
             "is_control": False,
             "report_match": False,
             "reported_evidence_region_match": False,
+            "declared_backup_match": False,
             "report_condition_role": "unreported_cue_comparator" if valid_report else "invalid_report_comparator",
             "selection_model": "deterministic_unreported_cue_comparator",
             "selected_candidate_label": _candidate_label(candidate),
@@ -459,6 +517,54 @@ def _report_condition_candidates(
     return result, "reported_cue_target"
 
 
+def _compose_commitment_chain(
+    source: Image.Image,
+    primary: GeneratedTwin,
+    backup: GeneratedTwin,
+) -> GeneratedTwin:
+    """Compose independently generated primary and declared-backup edits as pixel deltas."""
+    source_array = np.asarray(source.convert("RGB"), dtype=np.float32)
+    primary_array = np.asarray(primary.image.convert("RGB"), dtype=np.float32)
+    backup_array = np.asarray(backup.image.convert("RGB"), dtype=np.float32)
+    backup_alpha = np.asarray(backup.mask.convert("L"), dtype=np.float32)[..., None] / 255.0
+    combined = np.clip(
+        primary_array + backup_alpha * (backup_array - source_array),
+        0,
+        255,
+    ).astype(np.uint8)
+    union_mask = Image.fromarray(
+        np.maximum(
+            np.asarray(primary.mask.convert("L"), dtype=np.uint8),
+            np.asarray(backup.mask.convert("L"), dtype=np.uint8),
+        ),
+        mode="L",
+    )
+    metadata = dict(primary.metadata)
+    metadata.update({
+        "is_control": False,
+        "report_match": True,
+        "report_condition_role": "primary_plus_declared_backup_chain",
+        "selection_model": "precommitted_primary_then_declared_backup",
+        "primary_cue_family": primary.cue_family.value,
+        "primary_candidate_label": primary.metadata.get("selected_candidate_label", ""),
+        "declared_backup_cue": backup.cue_family.value,
+        "declared_backup_candidate_label": backup.metadata.get("selected_candidate_label", ""),
+        "selected_candidate_label": "{} + {}".format(
+            primary.metadata.get("selected_candidate_label", primary.cue_family.value),
+            backup.metadata.get("selected_candidate_label", backup.cue_family.value),
+        ),
+        "chain_composition": "primary_image_plus_masked_backup_pixel_delta",
+    })
+    return GeneratedTwin(
+        image=Image.fromarray(combined, mode="RGB"),
+        mask=union_mask,
+        cue_family=primary.cue_family,
+        operation="sequential_primary_plus_declared_backup_ablation",
+        target_region=union_mask.getbbox(),
+        metadata=metadata,
+    )
+
+
 def generate(config: Dict) -> Dict:
     output_dir = Path(config["run"]["output_dir"])
     checkpoint = Path(config["model"]["checkpoint"])
@@ -486,6 +592,7 @@ def generate(config: Dict) -> Dict:
         predictions = report_vlm.predict(
             source_images,
             cache_keys=["original::{}".format(sample.sample_id) for sample in samples],
+            include_commitment=bool(config["run"].get("commitment_audit", False)),
         )
         original_reports = dict(zip((sample.sample_id for sample in samples), predictions))
     generators = [
@@ -532,6 +639,7 @@ def generate(config: Dict) -> Dict:
                 "sample_id": sample.sample_id,
                 "reporting_model": config["model"]["vlm_model"],
                 "valid_report": original_reports[sample.sample_id].raw.get("parse_status") == "valid_constrained",
+                "valid_commitment": original_reports[sample.sample_id].raw.get("commitment_status") == "valid_commitment",
                 **original_reports[sample.sample_id].to_dict(),
             }
             for sample in samples
@@ -541,15 +649,14 @@ def generate(config: Dict) -> Dict:
             source = source_file.convert("RGB")
         context_foreground_mask = None
         report = original_reports.get(sample.sample_id)
+        primary_candidate = None
+        backup_candidate = None
         for generator in generators:
             allowed_cues = sample.metadata.get("allowed_cues")
             if allowed_cues and generator.cue_family.value not in allowed_cues:
-                if (
-                    report_conditioned
-                    and report
-                    and report.raw.get("parse_status") == "valid_constrained"
-                    and report.evidence_cue == generator.cue_family.value
-                ):
+                is_primary = bool(report and report.evidence_cue == generator.cue_family.value)
+                is_backup = bool(report and report.backup_cue == generator.cue_family.value)
+                if report_conditioned and report and (is_primary or is_backup):
                     intervention_rows.append(Intervention(
                         intervention_id="{}--{}--skipped".format(sample.sample_id, generator.cue_family.value),
                         sample_id=sample.sample_id,
@@ -558,12 +665,20 @@ def generate(config: Dict) -> Dict:
                         image_path="",
                         mask_path="",
                         eligible=False,
-                        skip_reason="reported_cue_disallowed_for_sample",
+                        skip_reason=(
+                            "reported_cue_disallowed_for_sample"
+                            if is_primary else "declared_backup_cue_disallowed_for_sample"
+                        ),
                         metadata={
                             "report_conditioned": True,
                             "original_reported_cue": report.evidence_cue,
                             "original_reported_evidence": report.evidence,
-                            "report_condition_role": "reported_cue_ungroundable",
+                            "original_declared_backup_cue": report.backup_cue,
+                            "original_declared_backup_evidence": report.backup_evidence,
+                            "report_condition_role": (
+                                "reported_cue_ungroundable"
+                                if is_primary else "declared_backup_cue_ungroundable"
+                            ),
                         },
                     ).to_dict())
                 continue
@@ -635,11 +750,22 @@ def generate(config: Dict) -> Dict:
                         "report_conditioned": report_conditioned,
                         "original_reported_cue": report.evidence_cue if report else "",
                         "original_reported_evidence": report.evidence if report else "",
-                        "report_condition_role": "reported_cue_ungroundable" if report and report.evidence_cue == generator.cue_family.value else "cue_unavailable",
+                        "report_condition_role": (
+                            "reported_cue_ungroundable"
+                            if report and report.evidence_cue == generator.cue_family.value
+                            else "declared_backup_cue_ungroundable"
+                            if selection_status.startswith("declared_backup_")
+                            else "cue_unavailable"
+                        ),
                     },
                 ).to_dict())
                 continue
             for index, candidate in enumerate(candidates):
+                role = candidate.metadata.get("report_condition_role")
+                if role == "reported_cue_target":
+                    primary_candidate = candidate
+                elif role == "declared_backup_cue_target":
+                    backup_candidate = candidate
                 identifier = "{}--{}--{:02d}".format(sample.sample_id, candidate.cue_family.value, index)
                 image_path = output_dir / "twins" / candidate.cue_family.value / "{}.png".format(identifier)
                 mask_path = output_dir / "masks" / candidate.cue_family.value / "{}.png".format(identifier)
@@ -658,6 +784,30 @@ def generate(config: Dict) -> Dict:
                     expected_direction=candidate.expected_direction,
                     metadata=candidate.metadata,
                 ).to_dict())
+        if (
+            bool(config["run"].get("sequential_backup_intervention", False))
+            and primary_candidate is not None
+            and backup_candidate is not None
+        ):
+            chain = _compose_commitment_chain(source, primary_candidate, backup_candidate)
+            identifier = "{}--commitment_chain--00".format(sample.sample_id)
+            image_path = output_dir / "twins" / "commitment_chain" / "{}.png".format(identifier)
+            mask_path = output_dir / "masks" / "commitment_chain" / "{}.png".format(identifier)
+            image_path.parent.mkdir(parents=True, exist_ok=True)
+            mask_path.parent.mkdir(parents=True, exist_ok=True)
+            chain.image.save(image_path)
+            chain.mask.save(mask_path)
+            intervention_rows.append(Intervention(
+                intervention_id=identifier,
+                sample_id=sample.sample_id,
+                cue_family=chain.cue_family,
+                operation=chain.operation,
+                image_path=str(image_path.resolve()),
+                mask_path=str(mask_path.resolve()),
+                target_region=chain.target_region,
+                expected_direction=chain.expected_direction,
+                metadata=chain.metadata,
+            ).to_dict())
     write_jsonl(output_dir / "interventions.jsonl", intervention_rows)
     write_annotation_template(output_dir / "human_validation_template.csv", intervention_rows)
     counts = Counter(row["cue_family"] for row in intervention_rows if row["eligible"])
@@ -668,7 +818,7 @@ def generate(config: Dict) -> Dict:
     )
     skipped = Counter(row["cue_family"] for row in intervention_rows if not row["eligible"])
     provenance = {
-        "framework_version": "0.5.0",
+        "framework_version": "0.6.0",
         "python": sys.version,
         "platform": platform.platform(),
         "torch": torch.__version__,
@@ -679,12 +829,24 @@ def generate(config: Dict) -> Dict:
             prediction.raw.get("parse_status") == "valid_constrained"
             for prediction in original_reports.values()
         ),
+        "valid_original_commitments": sum(
+            prediction.raw.get("commitment_status") == "valid_commitment"
+            for prediction in original_reports.values()
+        ),
         "reported_cue_targets": sum(
             row["eligible"] and row.get("metadata", {}).get("report_condition_role") == "reported_cue_target"
             for row in intervention_rows
         ),
         "unreported_cue_comparators": sum(
             row["eligible"] and row.get("metadata", {}).get("report_condition_role") == "unreported_cue_comparator"
+            for row in intervention_rows
+        ),
+        "declared_backup_cue_targets": sum(
+            row["eligible"] and row.get("metadata", {}).get("report_condition_role") == "declared_backup_cue_target"
+            for row in intervention_rows
+        ),
+        "primary_plus_backup_chains": sum(
+            row["eligible"] and row.get("metadata", {}).get("report_condition_role") == "primary_plus_declared_backup_chain"
             for row in intervention_rows
         ),
         "eligible_pairs_by_cue": dict(counts),
@@ -698,6 +860,21 @@ def generate(config: Dict) -> Dict:
 
 def _prediction_from_dict(payload: Dict) -> AffectPrediction:
     return AffectPrediction(**payload)
+
+
+def _observed_commitment_outcome(
+    original: AffectPrediction,
+    twin: AffectPrediction,
+    tolerance: float = 0.05,
+) -> str:
+    if twin.predicted_emotion != original.predicted_emotion:
+        return "label_change"
+    confidence_change = twin.confidence - original.confidence
+    if confidence_change < -tolerance:
+        return "confidence_decrease_same_label"
+    if confidence_change > tolerance:
+        return "confidence_increase_same_label"
+    return "no_material_change"
 
 
 def _human_target_distribution(sample: AffectSample) -> Dict[str, float]:
@@ -766,6 +943,11 @@ def evaluate(config: Dict) -> Dict:
                     caption=saved.get("caption", ""),
                     evidence=saved.get("evidence", ""),
                     evidence_cue=saved.get("evidence_cue", ""),
+                    cue_role=saved.get("cue_role", ""),
+                    expected_intervention_outcome=saved.get("expected_intervention_outcome", ""),
+                    expected_emotion_after_intervention=saved.get("expected_emotion_after_intervention", ""),
+                    backup_cue=saved.get("backup_cue", ""),
+                    backup_evidence=saved.get("backup_evidence", ""),
                     raw=saved.get("raw", {}),
                 )
         missing_original_ids = [
@@ -781,11 +963,13 @@ def evaluate(config: Dict) -> Dict:
                 vlm.predict(
                     missing_original_images,
                     cache_keys=["original::{}".format(sample_id) for sample_id in missing_original_ids],
+                    include_commitment=bool(config["run"].get("commitment_audit", False)),
                 ),
             )))
         selected_twin_predictions = vlm.predict(
             [twin_images[index] for index in selected_indices],
             cache_keys=["twin::{}".format(eligible[index]["intervention_id"]) for index in selected_indices],
+            include_commitment=False,
         )
         vlm_twins_by_id = {
             eligible[index]["intervention_id"]: prediction
@@ -819,7 +1003,21 @@ def evaluate(config: Dict) -> Dict:
             "reported_evidence_region_match": float(intervention.get("metadata", {}).get("reported_evidence_region_match", False)),
             "reported_region_selection_status": intervention.get("metadata", {}).get("reported_region_selection_status", ""),
             "reported_evidence_matched_terms": ";".join(intervention.get("metadata", {}).get("reported_evidence_matched_terms", [])),
+            "declared_backup_match": float(intervention.get("metadata", {}).get("declared_backup_match", False)),
+            "declared_backup_evidence_region_match": float(intervention.get("metadata", {}).get("declared_backup_evidence_region_match", False)),
+            "backup_region_selection_status": intervention.get("metadata", {}).get("backup_region_selection_status", ""),
+            "original_commitment_valid": float(intervention.get("metadata", {}).get("original_commitment_valid", False)),
+            "original_declared_cue_role": intervention.get("metadata", {}).get("original_declared_cue_role", ""),
+            "original_expected_intervention_outcome": intervention.get("metadata", {}).get("original_expected_intervention_outcome", ""),
+            "original_expected_emotion_after_intervention": intervention.get("metadata", {}).get("original_expected_emotion_after_intervention", ""),
+            "original_declared_backup_cue": intervention.get("metadata", {}).get("original_declared_backup_cue", ""),
+            "original_declared_backup_evidence": intervention.get("metadata", {}).get("original_declared_backup_evidence", ""),
+            "primary_cue_family": intervention.get("metadata", {}).get("primary_cue_family", ""),
+            "declared_backup_cue": intervention.get("metadata", {}).get("declared_backup_cue", ""),
+            "primary_candidate_label": intervention.get("metadata", {}).get("primary_candidate_label", ""),
+            "declared_backup_candidate_label": intervention.get("metadata", {}).get("declared_backup_candidate_label", ""),
             "au_annotation_backed": float(intervention.get("metadata", {}).get("au_annotation_backed", False)),
+            "au_annotation_consistent": intervention.get("metadata", {}).get("au_annotation_consistent"),
             "target_active_aus": ";".join(intervention.get("metadata", {}).get("target_active_aus", [])),
             "eligible": True,
             "source_emotion": sample.emotion,
@@ -862,6 +1060,32 @@ def evaluate(config: Dict) -> Dict:
             vo, vt = vlm_original_by_id[sample.sample_id], vlm_twins_by_id[intervention["intervention_id"]]
             from .metrics import entropy, token_jaccard
             vlm_valid = vo.raw.get("parse_status") == "valid_constrained" and vt.raw.get("parse_status") == "valid_constrained"
+            observed_outcome = _observed_commitment_outcome(vo, vt)
+            commitment_valid = vo.raw.get("commitment_status") == "valid_commitment"
+            expected_outcome_match = bool(
+                commitment_valid
+                and observed_outcome == vo.expected_intervention_outcome
+            )
+            expected_emotion_match = bool(
+                commitment_valid
+                and vt.predicted_emotion == vo.expected_emotion_after_intervention
+            )
+            substituted = vt.evidence_cue != vo.evidence_cue
+            backup_declared = vo.backup_cue not in {"", "none"}
+            backup_match = backup_declared and vt.evidence_cue == vo.backup_cue
+            role_expected_outcome = {
+                "essential": "label_change",
+                "supportive": "confidence_decrease_same_label",
+                "incidental": "no_material_change",
+            }.get(vo.cue_role, "")
+            role_outcome_coherent = bool(role_expected_outcome) and (
+                role_expected_outcome == vo.expected_intervention_outcome
+            )
+            outcome_emotion_coherent = (
+                vo.expected_emotion_after_intervention != vo.predicted_emotion
+                if vo.expected_intervention_outcome == "label_change"
+                else vo.expected_emotion_after_intervention == vo.predicted_emotion
+            )
             row.update({
                 "vlm_valid": float(vlm_valid),
                 "vlm_original_parse_status": vo.raw.get("parse_status", ""),
@@ -886,6 +1110,36 @@ def evaluate(config: Dict) -> Dict:
                 "vlm_original_prediction_flip": float(vo.predicted_emotion != vt.predicted_emotion),
                 "vlm_confidence_change": vt.confidence - vo.confidence,
                 "vlm_va_distance": float(math.hypot(vt.valence - vo.valence, vt.arousal - vo.arousal)),
+                "vlm_commitment_valid": float(commitment_valid),
+                "vlm_declared_cue_role": vo.cue_role,
+                "vlm_expected_intervention_outcome": vo.expected_intervention_outcome,
+                "vlm_expected_emotion_after_intervention": vo.expected_emotion_after_intervention,
+                "vlm_declared_backup_cue": vo.backup_cue,
+                "vlm_declared_backup_evidence": vo.backup_evidence,
+                "vlm_observed_intervention_outcome": observed_outcome,
+                "vlm_outcome_type_commitment_match": float(expected_outcome_match),
+                "vlm_expected_emotion_match": float(expected_emotion_match),
+                "vlm_counterfactual_commitment_kept": float(
+                    expected_outcome_match and expected_emotion_match
+                ),
+                "vlm_role_outcome_declaration_coherent": float(
+                    role_outcome_coherent
+                ),
+                "vlm_outcome_emotion_declaration_coherent": float(outcome_emotion_coherent),
+                "vlm_commitment_declaration_coherent": float(
+                    role_outcome_coherent and outcome_emotion_coherent
+                ),
+                "vlm_cue_substitution": float(substituted),
+                "vlm_declared_backup_cue_activated": float(backup_match),
+                "vlm_post_edit_rerationalization": float(
+                    substituted and not backup_match
+                ),
+                "vlm_forecast_consistent_stability": float(
+                    commitment_valid
+                    and vo.expected_intervention_outcome != "label_change"
+                    and vt.predicted_emotion == vo.predicted_emotion
+                    and (not substituted or backup_match)
+                ),
             })
         rows.append(row)
     enabled_cues = config["run"].get("enabled_cues", [cue.value for cue in CueFamily])
@@ -900,6 +1154,7 @@ def evaluate(config: Dict) -> Dict:
         "vlm_model": config["model"].get("vlm_model", ""),
         "vlm_pairs_evaluated": len(vlm_twins_by_id),
         "report_conditioned": bool(config["run"].get("report_conditioned", False)),
+        "commitment_audit": bool(config["run"].get("commitment_audit", False)),
         "audited_cue_families": list(enabled_cues),
         "reported_cue_target_coverage": (
             len({
@@ -918,6 +1173,8 @@ def evaluate(config: Dict) -> Dict:
             if saved_reports else 0.0
         )
         valid_report_count = sum(row.get("valid_report", False) for row in saved_reports)
+        valid_commitments = [row for row in saved_reports if row.get("valid_commitment", False)]
+        valid_commitment_count = len(valid_commitments)
         grounded_sample_count = len({
             row["sample_id"] for row in rows
             if row.get("report_condition_role") == "reported_cue_target"
@@ -925,6 +1182,24 @@ def evaluate(config: Dict) -> Dict:
         })
         summary["valid_report_exact_grounding_rate"] = (
             grounded_sample_count / valid_report_count if valid_report_count else 0.0
+        )
+        summary["original_commitment_valid_rate"] = (
+            valid_commitment_count / len(saved_reports) if saved_reports else 0.0
+        )
+        summary["valid_commitment_primary_target_rate"] = (
+            grounded_sample_count / valid_commitment_count if valid_commitment_count else 0.0
+        )
+        declared_backups = [
+            row for row in valid_commitments
+            if row.get("backup_cue") not in {"", "none"}
+        ]
+        grounded_backup_count = len({
+            row["sample_id"] for row in rows
+            if row.get("report_condition_role") == "declared_backup_cue_target"
+            and row.get("declared_backup_evidence_region_match") == 1.0
+        })
+        summary["declared_backup_grounding_rate"] = (
+            grounded_backup_count / len(declared_backups) if declared_backups else float("nan")
         )
     write_csv(output_dir / "pair_metrics.csv", rows)
     write_json(output_dir / "summary.json", summary)

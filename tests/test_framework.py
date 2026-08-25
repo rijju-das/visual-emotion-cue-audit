@@ -17,7 +17,12 @@ from affective_twins.interventions.text import TextIntervention
 from affective_twins.metrics import aggregate, bootstrap_mean_ci, js_divergence, pair_metrics
 from affective_twins.models.smolvlm import SmolVLMAdapter
 from affective_twins.models.resnet import SampleDataset
-from affective_twins.runner import _report_condition_candidates, _require_sample_images
+from affective_twins.runner import (
+    _compose_commitment_chain,
+    _observed_commitment_outcome,
+    _report_condition_candidates,
+    _require_sample_images,
+)
 from affective_twins.schema import AffectPrediction, AffectSample, CueFamily
 
 
@@ -352,6 +357,16 @@ def test_vlm_evidence_phrase_is_conditioned_on_its_emotion_and_cue_report():
                 return "high"
             if question.startswith("You classified"):
                 return "bright yellow clothing"
+            if question.startswith("You predicted"):
+                return "supportive"
+            if question.startswith("Suppose only"):
+                return "confidence_decrease_same_label"
+            if question.startswith("After the hypothetical"):
+                return "joy"
+            if question.startswith("If the reported evidence"):
+                return "scene_context"
+            if question.startswith("Name the background setting"):
+                return "sunny outdoor field"
             return "A person wears bright clothing."
 
     vlm = StubVLM()
@@ -362,6 +377,93 @@ def test_vlm_evidence_phrase_is_conditioned_on_its_emotion_and_cue_report():
     assert "joy" in evidence_question
     assert "color or lighting" in evidence_question
     assert report.evidence == "bright yellow clothing"
+    assert report.cue_role == "supportive"
+    assert report.expected_intervention_outcome == "confidence_decrease_same_label"
+    assert report.expected_emotion_after_intervention == "joy"
+    assert report.backup_cue == "scene_context"
+    assert report.backup_evidence == "sunny outdoor field"
+    assert report.raw["commitment_status"] == "valid_commitment"
+
+
+def test_declared_backup_is_grounded_to_its_exact_evidence():
+    class StubLocator:
+        def predict(self, images):
+            return [prediction("joy") for _ in images], None
+
+    source = Image.new("RGB", (20, 20), "orange")
+    candidates = [
+        GeneratedTwin(
+            source,
+            Image.new("L", (20, 20), 255),
+            CueFamily.COLOR,
+            "desaturate",
+            metadata={"panoptic_label": label},
+        )
+        for label in ["person", "wall"]
+    ]
+    report = prediction("joy")
+    report.evidence_cue = "scene_context"
+    report.evidence = "park"
+    report.cue_role = "supportive"
+    report.expected_intervention_outcome = "confidence_decrease_same_label"
+    report.expected_emotion_after_intervention = "joy"
+    report.backup_cue = "color_lighting"
+    report.backup_evidence = "wall"
+    report.raw.update({
+        "parse_status": "valid_constrained",
+        "commitment_required": True,
+        "commitment_status": "valid_commitment",
+    })
+    selected, status = _report_condition_candidates(
+        None,
+        StubLocator(),
+        source,
+        candidates,
+        AffectSample("sample", "unused.jpg", "joy"),
+        report,
+        include_control=False,
+    )
+    assert status == "declared_backup_cue_target"
+    assert selected[0].metadata["selected_candidate_label"].startswith("wall")
+    assert selected[0].metadata["declared_backup_evidence_region_match"]
+
+
+def test_commitment_chain_combines_primary_and_backup_pixel_edits():
+    source = Image.new("RGB", (12, 8), "white")
+    primary_mask = Image.new("L", source.size, 0)
+    backup_mask = Image.new("L", source.size, 0)
+    ImageDraw.Draw(primary_mask).rectangle((0, 0, 3, 7), fill=255)
+    ImageDraw.Draw(backup_mask).rectangle((8, 0, 11, 7), fill=255)
+    primary_image = source.copy()
+    backup_image = source.copy()
+    ImageDraw.Draw(primary_image).rectangle((0, 0, 3, 7), fill="red")
+    ImageDraw.Draw(backup_image).rectangle((8, 0, 11, 7), fill="blue")
+    primary = GeneratedTwin(
+        primary_image, primary_mask, CueFamily.COLOR, "primary",
+        metadata={"selected_candidate_label": "person"},
+    )
+    backup = GeneratedTwin(
+        backup_image, backup_mask, CueFamily.CONTEXT, "backup",
+        metadata={"selected_candidate_label": "wall"},
+    )
+    chain = _compose_commitment_chain(source, primary, backup)
+    pixels = np.asarray(chain.image)
+    assert np.all(pixels[:, :4] == np.array([255, 0, 0]))
+    assert np.all(pixels[:, 8:] == np.array([0, 0, 255]))
+    assert chain.metadata["report_condition_role"] == "primary_plus_declared_backup_chain"
+
+
+def test_observed_commitment_outcome_uses_label_then_confidence():
+    original = prediction("joy", 0.75)
+    original.confidence = 0.75
+    changed = prediction("sadness", 0.70)
+    decreased = prediction("joy", 0.60)
+    stable = prediction("joy", 0.74)
+    decreased.confidence = 0.60
+    stable.confidence = 0.74
+    assert _observed_commitment_outcome(original, changed) == "label_change"
+    assert _observed_commitment_outcome(original, decreased) == "confidence_decrease_same_label"
+    assert _observed_commitment_outcome(original, stable) == "no_material_change"
 
 
 def test_reported_mouth_evidence_intervenes_on_mouth_not_brows():
@@ -491,11 +593,72 @@ def test_report_conditioned_metrics_compare_reported_target_to_controls():
         row("scene_context", "unreported_cue_comparator", 0.03, 0.01),
         row("color_lighting", "same_cue_matched_region_control", 0.04, 0.02, is_control=1.0),
     ])
-    faithfulness = summary["report_conditioned_faithfulness"]
+    faithfulness = summary["reported_cue_behavioral_sensitivity"]
     assert faithfulness["original_class_probability_drop_mean"] == pytest.approx(0.20)
     assert faithfulness["reported_minus_unreported_drop_mean"] == pytest.approx(0.17)
     assert faithfulness["reported_minus_same_cue_control_drop_mean"] == pytest.approx(0.16)
     assert faithfulness["prediction_flip_rate"] == 1.0
+
+
+def test_commitment_metrics_keep_sequential_twins_separate():
+    def row(role, cue, drop, twin_label="joy"):
+        return {
+            "sample_id": "sample",
+            "cue_family": cue,
+            "operation": "test_edit",
+            "eligible": True,
+            "is_control": 0.0,
+            "original_confidence": 0.78,
+            "original_correct": 1.0,
+            "original_folder_correct": float("nan"),
+            "folder_human_agreement": float("nan"),
+            "original_brier": 0.1,
+            "original_nll": 0.2,
+            "original_valence_absolute_error": 0.1,
+            "original_arousal_absolute_error": 0.1,
+            "directional_success": 1.0,
+            "source_probability_drop": drop,
+            "emotion_js_divergence": 0.05,
+            "va_distance": 0.1,
+            "feature_cosine": 0.95,
+            "entropy_change": 0.04,
+            "report_condition_role": role,
+            "vlm_valid": 1.0,
+            "vlm_commitment_valid": 1.0,
+            "vlm_cue_grounded": 1.0,
+            "vlm_caption_jaccard": 0.8,
+            "vlm_original_class_probability_drop": drop,
+            "vlm_original_prediction_flip": float(twin_label != "joy"),
+            "vlm_original_prediction": "joy",
+            "vlm_twin_prediction": twin_label,
+            "vlm_entropy_change": 0.05,
+            "vlm_reported_cue_retained": 0.0,
+        }
+
+    primary = row("reported_cue_target", "color_lighting", 0.12)
+    primary.update({
+        "vlm_declared_cue_role": "supportive",
+        "vlm_outcome_type_commitment_match": 1.0,
+        "vlm_expected_emotion_match": 1.0,
+        "vlm_counterfactual_commitment_kept": 1.0,
+        "vlm_role_outcome_declaration_coherent": 1.0,
+        "vlm_outcome_emotion_declaration_coherent": 1.0,
+        "vlm_commitment_declaration_coherent": 1.0,
+        "vlm_cue_substitution": 1.0,
+        "vlm_declared_backup_cue": "scene_context",
+        "vlm_declared_backup_cue_activated": 1.0,
+        "vlm_post_edit_rerationalization": 0.0,
+        "vlm_forecast_consistent_stability": 1.0,
+    })
+    backup = row("declared_backup_cue_target", "scene_context", 0.08)
+    chain = row("primary_plus_declared_backup_chain", "color_lighting", 0.25, twin_label="sadness")
+    summary = aggregate([primary, backup, chain])
+    commitments = summary["counterfactual_cue_commitments"]
+    assert summary["n_pairs"] == 2
+    assert commitments["exact_commitment_accuracy"] == 1.0
+    assert commitments["declared_backup_activation_rate_given_substitution"] == 1.0
+    assert commitments["n_primary_plus_backup_chains"] == 1
+    assert commitments["chain_incremental_class_drop_over_primary_mean"] == pytest.approx(0.13)
 
 
 def test_three_cue_audit_does_not_penalize_absent_text_family():

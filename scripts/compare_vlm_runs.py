@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare report-conditioned audit runs without pooling distinct target VLMs."""
+"""Compare counterfactual cue-commitment runs without pooling target VLMs."""
 
 import argparse
 import csv
@@ -54,7 +54,11 @@ def collect(label, run_dir):
     ]
     drops = [value for value in drops if value is not None]
     flips = [float(row.get("vlm_original_prediction_flip", 0.0)) for row in valid_targets]
-    faithfulness = summary.get("report_conditioned_faithfulness", {})
+    commitments = summary.get("counterfactual_cue_commitments", {})
+    if not commitments:
+        raise ValueError(
+            "{} is a legacy run without counterfactual cue commitments; rerun with a commitment config".format(run_dir)
+        )
     cue_counts = Counter(row.get("evidence_cue", "invalid") for row in valid_reports)
     return {
         "label": label,
@@ -62,17 +66,25 @@ def collect(label, run_dir):
         "vlm_model": summary.get("vlm_model") or (reports[0].get("reporting_model") if reports else ""),
         "samples": len(samples),
         "valid_report_rate": len(valid_reports) / len(reports) if reports else 0.0,
+        "valid_commitment_rate": summary.get("original_commitment_valid_rate", 0.0),
         "valid_report_human_accuracy": len(correct_reports) / len(valid_reports) if valid_reports else 0.0,
         "exact_grounding_rate": summary.get(
-            "valid_report_exact_grounding_rate",
+            "valid_commitment_primary_target_rate",
             len(exact_targets) / len(valid_reports) if valid_reports else 0.0,
         ),
         "exact_grounded_targets": len(exact_targets),
         "valid_exact_target_pairs": len(valid_targets),
         "target_prediction_flip_rate": sum(flips) / len(flips) if flips else 0.0,
         "target_original_class_drop_mean": sum(drops) / len(drops) if drops else 0.0,
-        "reported_minus_unreported_drop_mean": faithfulness.get("reported_minus_unreported_drop_mean"),
-        "reported_minus_same_cue_control_drop_mean": faithfulness.get("reported_minus_same_cue_control_drop_mean"),
+        "outcome_type_accuracy": commitments.get("outcome_type_accuracy"),
+        "expected_emotion_accuracy": commitments.get("expected_emotion_accuracy"),
+        "exact_commitment_accuracy": commitments.get("exact_commitment_accuracy"),
+        "declaration_coherence_rate": commitments.get("full_declaration_coherence_rate"),
+        "cue_substitution_rate": commitments.get("cue_substitution_rate"),
+        "backup_activation_rate": commitments.get("declared_backup_activation_rate_given_substitution"),
+        "rerationalization_rate": commitments.get("post_edit_rerationalization_rate"),
+        "chain_count": commitments.get("n_primary_plus_backup_chains", 0),
+        "chain_incremental_drop": commitments.get("chain_incremental_class_drop_over_primary_mean"),
         "reported_cue_counts": dict(sorted(cue_counts.items())),
     }
 
@@ -109,27 +121,31 @@ def main():
     table_rows = []
     for row in rows:
         table_rows.append(
-            "| {label} | {valid} | {accuracy} | {grounding} | {targets} | {flip} | {drop} | {unreported} | {control} |".format(
+            "| {label} | {valid} | {commitment} | {grounding} | {targets} | {coherence} | {outcome} | {emotion} | {exact} | {backup} | {rerationalization} | {chains} | {increment} |".format(
                 label=row["label"],
                 valid=percent(row["valid_report_rate"]),
-                accuracy=percent(row["valid_report_human_accuracy"]),
+                commitment=percent(row["valid_commitment_rate"]),
                 grounding=percent(row["exact_grounding_rate"]),
                 targets=row["exact_grounded_targets"],
-                flip=percent(row["target_prediction_flip_rate"]),
-                drop=number(row["target_original_class_drop_mean"]),
-                unreported=number(row["reported_minus_unreported_drop_mean"]),
-                control=number(row["reported_minus_same_cue_control_drop_mean"]),
+                coherence=percent(row["declaration_coherence_rate"]),
+                outcome=percent(row["outcome_type_accuracy"]),
+                emotion=percent(row["expected_emotion_accuracy"]),
+                exact=percent(row["exact_commitment_accuracy"]),
+                backup=percent(row["backup_activation_rate"]),
+                rerationalization=percent(row["rerationalization_rate"]),
+                chains=row["chain_count"],
+                increment=number(row["chain_incremental_drop"]),
             )
         )
-    report = """# Exact-grounding VLM comparison
+    report = """# Counterfactual Cue Commitment VLM comparison
 
-Each VLM is audited against its own immutable pre-intervention report. Results are not pooled because the models can report different cues and therefore induce different twins.
+Each VLM is audited against its own immutable prospective commitment. Results are not pooled because models can name different primary and backup evidence and therefore induce different twins.
 
-| VLM | Valid reports | Human-label accuracy | Exact grounding | Exact targets | Target flip | Target class drop | Target − unreported | Target − same-cue control |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| VLM | Valid reports | Valid commitments | Exact grounding | Targets | Coherent contract | Outcome forecast | Emotion forecast | Exact commitment | Backup activation | Rerationalization | Chains | Chain incremental drop |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 {rows}
 
-Probability drops use the framework's ordinal confidence proxy. Prediction flips and target-minus-control differences are the primary behavioural comparisons. A low exact-grounding rate is itself an audit result: the reported evidence could not be matched to an eligible visible region without substitution.
+Categorical outcome and post-edit emotion forecasts are the primary endpoints. Probability drops use an ordinal confidence proxy. Backup activation tests whether a model switches to the fallback it declared before intervention; rerationalization records a switch to some other cue. A low grounding rate is itself an audit result because the stated evidence could not be matched without substitution.
 """.format(rows="\n".join(table_rows))
     (output_dir / "comparison.md").write_text(report)
     print(json.dumps({"output_dir": str(output_dir), "runs": rows}, indent=2, sort_keys=True))

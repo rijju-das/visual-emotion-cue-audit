@@ -12,8 +12,6 @@ from PIL import Image
 from ..schema import AffectPrediction, EMOTIONS
 
 
-PROMPT = """Inspect the image as an affective-computing auditor. Return ONLY one JSON object with keys: emotion (one of anger, disgust, fear, joy, sadness, surprise), emotion_probabilities (object over those six labels summing to 1), valence (number -1 to 1), arousal (number -1 to 1), confidence (number 0 to 1), evidence_cue (one of color_lighting, facial_action_region, scene_context, embedded_text), evidence (short visible evidence phrase), caption (one literal sentence). Do not infer a person's private internal state; describe the apparent scene affect."""
-
 EMOTION_PROMPT = "Classify the apparent emotion. Reply with exactly one word from: anger, disgust, fear, joy, sadness, surprise."
 CUE_DESCRIPTIONS = {
     "color_lighting": "color_lighting",
@@ -45,6 +43,27 @@ EVIDENCE_PROMPTS = {
     ),
 }
 CAPTION_PROMPT = "Describe the visible image literally in one short sentence. Do not infer private internal states."
+CUE_ROLE_PROMPT = (
+    "You predicted {emotion} using {cue} evidence at '{evidence}'. Before any edit is shown, classify the role "
+    "of that evidence. Reply exactly one word: essential, supportive, or incidental. Essential means removing it "
+    "should change the emotion label; supportive means the label may remain but confidence should decrease; "
+    "incidental means its removal should cause no material change."
+)
+OUTCOME_PROMPT = (
+    "Suppose only the reported evidence '{evidence}' for {cue} is attenuated while other visible content is "
+    "preserved. Commit before seeing the edit. Reply exactly one token: label_change, "
+    "confidence_decrease_same_label, or no_material_change."
+)
+EXPECTED_EMOTION_PROMPT = (
+    "After the hypothetical attenuation of '{evidence}', which apparent emotion do you expect to predict? "
+    "Reply with exactly one word from: anger, disgust, fear, joy, sadness, surprise."
+)
+BACKUP_EVIDENCE_PROMPTS = {
+    "color_lighting": "Name one visible object or scene region whose colour or lighting would be your backup evidence. Reply only with that region phrase.",
+    "facial_action_region": "Which facial component would be your backup evidence? Reply exactly one word: brows, eyes, or mouth.",
+    "scene_context": "Name the background setting or surrounding scene that would be your backup evidence in at most six words.",
+    "embedded_text": "Transcribe the one visible word that would be your backup evidence. Reply only with that word.",
+}
 
 
 class SmolVLMAdapter:
@@ -140,7 +159,7 @@ class SmolVLMAdapter:
             generated[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True
         )[0].strip()
 
-    def _predict_one(self, image: Image.Image) -> AffectPrediction:
+    def _predict_one(self, image: Image.Image, include_commitment: bool = True) -> AffectPrediction:
         responses: Dict[str, str] = {}
         responses["emotion"] = self._ask(image, EMOTION_PROMPT)
         cue_prompt = "Choose the strongest visible affect cue. Reply exactly one token from: {}.".format(
@@ -182,6 +201,64 @@ class SmolVLMAdapter:
         probabilities[emotion] = confidence
         evidence = facial_component or re.sub(r"\s+", " ", responses["evidence"]).strip()[:240]
         caption = re.sub(r"\s+", " ", responses["caption"]).strip()[:320]
+        cue_role = ""
+        expected_outcome = ""
+        expected_emotion = ""
+        backup_cue = ""
+        backup_evidence = ""
+        commitment_valid = False
+        if include_commitment and valid:
+            responses["cue_role"] = self._ask(
+                image,
+                CUE_ROLE_PROMPT.format(emotion=emotion, cue=cue, evidence=evidence),
+                max_new_tokens=8,
+            )
+            responses["expected_outcome"] = self._ask(
+                image,
+                OUTCOME_PROMPT.format(cue=cue, evidence=evidence),
+                max_new_tokens=12,
+            )
+            responses["expected_emotion"] = self._ask(
+                image,
+                EXPECTED_EMOTION_PROMPT.format(evidence=evidence),
+                max_new_tokens=8,
+            )
+            backup_choices = [candidate for candidate in self.allowed_cues if candidate != cue] + ["none"]
+            responses["backup_cue"] = self._ask(
+                image,
+                "If the reported evidence is attenuated, choose the single backup cue you would rely on next. "
+                "Reply exactly one token from: {}.".format(", ".join(backup_choices)),
+                max_new_tokens=10,
+            )
+            cue_role = self._choice(responses["cue_role"], ["essential", "supportive", "incidental"]) or ""
+            expected_outcome = self._choice(
+                responses["expected_outcome"],
+                ["label_change", "confidence_decrease_same_label", "no_material_change"],
+            ) or ""
+            expected_emotion = self._choice(responses["expected_emotion"], EMOTIONS) or ""
+            backup_cue = self._choice(responses["backup_cue"], backup_choices) or ""
+            if backup_cue and backup_cue != "none":
+                responses["backup_evidence"] = self._ask(
+                    image,
+                    BACKUP_EVIDENCE_PROMPTS[backup_cue],
+                    max_new_tokens=16,
+                )
+                if backup_cue == "facial_action_region":
+                    backup_evidence = self._choice(
+                        responses["backup_evidence"], ["brows", "eyes", "mouth"]
+                    ) or ""
+                else:
+                    backup_evidence = re.sub(r"\s+", " ", responses["backup_evidence"]).strip()[:240]
+            else:
+                responses["backup_evidence"] = "none"
+                backup_evidence = "none" if backup_cue == "none" else ""
+            commitment_valid = all([
+                cue_role,
+                expected_outcome,
+                expected_emotion,
+                backup_cue,
+                backup_evidence,
+            ])
         return AffectPrediction(
             emotion_probabilities=probabilities,
             valence={"negative": -0.67, "neutral": 0.0, "positive": 0.67}.get(valence_word, 0.0),
@@ -191,11 +268,22 @@ class SmolVLMAdapter:
             caption=caption,
             evidence=evidence,
             evidence_cue=cue,
+            cue_role=cue_role,
+            expected_intervention_outcome=expected_outcome,
+            expected_emotion_after_intervention=expected_emotion,
+            backup_cue=backup_cue,
+            backup_evidence=backup_evidence,
             raw={
                 "responses": responses,
                 "parse_status": "valid_constrained" if valid else "invalid_constrained",
                 "probability_source": "ordinal_confidence_proxy",
                 "evidence_status": "specific_region" if evidence_valid else "invalid_region",
+                "commitment_required": include_commitment,
+                "commitment_status": (
+                    "valid_commitment" if commitment_valid
+                    else "invalid_commitment" if include_commitment
+                    else "not_requested"
+                ),
             },
         )
 
@@ -329,23 +417,29 @@ class SmolVLMAdapter:
             (
                 self.model_name
                 + "|cues=" + ",".join(self.allowed_cues)
-                + "|constrained-v5-three-cue-exact-grounding|"
+                + "|constrained-v6-counterfactual-cue-commitment|"
                 + key
             ).encode("utf-8")
         ).hexdigest()
         return self.cache_dir / "{}.json".format(digest)
 
-    def predict(self, images: List[Image.Image], cache_keys: Optional[Sequence[str]] = None) -> List[AffectPrediction]:
+    def predict(
+        self,
+        images: List[Image.Image],
+        cache_keys: Optional[Sequence[str]] = None,
+        include_commitment: bool = True,
+    ) -> List[AffectPrediction]:
         if cache_keys is not None and len(cache_keys) != len(images):
             raise ValueError("cache_keys must align with images")
         predictions = []
         for index, image in enumerate(images):
-            key = cache_keys[index] if cache_keys is not None else "image-{}".format(index)
+            base_key = cache_keys[index] if cache_keys is not None else "image-{}".format(index)
+            key = "{}::commitment={}".format(base_key, int(include_commitment))
             cache_path = self._cache_path(key)
             if cache_path and cache_path.is_file():
                 predictions.append(AffectPrediction(**json.loads(cache_path.read_text())))
                 continue
-            prediction = self._predict_one(image)
+            prediction = self._predict_one(image, include_commitment=include_commitment)
             if cache_path:
                 temporary = cache_path.with_suffix(".tmp")
                 temporary.write_text(json.dumps(prediction.to_dict(), indent=2, sort_keys=True))

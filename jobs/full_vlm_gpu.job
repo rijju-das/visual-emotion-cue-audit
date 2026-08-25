@@ -1,11 +1,11 @@
 #!/bin/bash
 
 #SBATCH -p compute
-#SBATCH -J vea_rcaudit
+#SBATCH -J vea_commit
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32000
 #SBATCH --gres=gpu:1
-#SBATCH -t 0-12:00:00
+#SBATCH -t 1-00:00:00
 #SBATCH --mail-type=END,FAIL --mail-user=riju.das@ucdconnect.ie
 
 source /home/rdas/miniconda/etc/profile.d/conda.sh
@@ -22,7 +22,7 @@ mkdir -p "$HF_HOME" "$TORCH_HOME" "$MPLCONFIGDIR"
 
 python -m pip install -e '.[face,vlm]' || exit 1
 
-affective-twins doctor --config configs/emotion6_abaw80_exact_qwen25vl3b_server.json
-affective-twins generate --config configs/emotion6_abaw80_exact_qwen25vl3b_server.json || exit 1
-affective-twins evaluate --config configs/emotion6_abaw80_exact_qwen25vl3b_server.json || exit 1
-affective-twins report --config configs/emotion6_abaw80_exact_qwen25vl3b_server.json || exit 1
+affective-twins doctor --config configs/emotion6_abaw80_commitment_qwen25vl3b_server.json || exit 1
+affective-twins generate --config configs/emotion6_abaw80_commitment_qwen25vl3b_server.json || exit 1
+affective-twins evaluate --config configs/emotion6_abaw80_commitment_qwen25vl3b_server.json || exit 1
+affective-twins report --config configs/emotion6_abaw80_commitment_qwen25vl3b_server.json || exit 1

@@ -81,6 +81,17 @@ def aggregate(rows: List[Dict], expected_cues=None) -> Dict:
         "color_lighting", "facial_action_region", "scene_context", "embedded_text"
     ])
     all_eligible = [row for row in rows if row.get("eligible", True)]
+    chain_rows = [
+        row for row in all_eligible
+        if row.get("report_condition_role") == "primary_plus_declared_backup_chain"
+    ]
+    # Sequential primary+backup twins answer a separate commitment question.
+    # Exclude them from the conventional one-cue aggregate so that they do not
+    # double-count samples or inflate cue coverage and sensitivity estimates.
+    all_eligible = [
+        row for row in all_eligible
+        if row.get("report_condition_role") != "primary_plus_declared_backup_chain"
+    ]
     controls = [row for row in all_eligible if row.get("is_control", 0.0) == 1.0]
     eligible = [row for row in all_eligible if row.get("is_control", 0.0) != 1.0]
     if not eligible:
@@ -202,7 +213,7 @@ def aggregate(rows: List[Dict], expected_cues=None) -> Dict:
                 "entropy_increase_rate": float(np.mean([row["vlm_entropy_change"] > 0 for row in group])),
                 "reported_cue_retention_rate": float(np.mean([row["vlm_reported_cue_retained"] for row in group])),
             }
-        result["report_conditioned_faithfulness"] = {
+        result["reported_cue_behavioral_sensitivity"] = {
             "n_reported_cue_targets": len(reported_targets),
             "n_unreported_cue_comparators": len(unreported_comparators),
             "original_class_probability_drop_mean": float(np.mean(target_drops)),
@@ -229,4 +240,117 @@ def aggregate(rows: List[Dict], expected_cues=None) -> Dict:
             "by_reported_cue": by_reported_cue,
             "probability_note": "VLM probabilities are ordinal confidence proxies; prediction flips are the primary behavioural endpoint.",
         }
+    commitment_targets = [
+        row for row in reported_targets
+        if row.get("vlm_commitment_valid") == 1.0
+    ]
+    if commitment_targets:
+        def group_rate(group, key):
+            return float(np.mean([row[key] for row in group])) if group else float("nan")
+
+        by_role = {}
+        for role in ["essential", "supportive", "incidental"]:
+            group = [row for row in commitment_targets if row.get("vlm_declared_cue_role") == role]
+            if group:
+                by_role[role] = {
+                    "n": len(group),
+                    "outcome_type_accuracy": group_rate(group, "vlm_outcome_type_commitment_match"),
+                    "exact_commitment_accuracy": group_rate(group, "vlm_counterfactual_commitment_kept"),
+                    "prediction_flip_rate": group_rate(group, "vlm_original_prediction_flip"),
+                    "original_class_probability_drop_mean": float(np.mean([
+                        row["vlm_original_class_probability_drop"] for row in group
+                    ])),
+                }
+
+        substitutions = [row for row in commitment_targets if row["vlm_cue_substitution"] == 1.0]
+        substitutions_with_backup = [
+            row for row in substitutions
+            if row.get("vlm_declared_backup_cue") not in {"", "none"}
+        ]
+        backup_targets = [
+            row for row in eligible
+            if row.get("report_condition_role") == "declared_backup_cue_target"
+            and row.get("vlm_valid") == 1.0
+            and row.get("vlm_commitment_valid") == 1.0
+        ]
+        valid_chains = [
+            row for row in chain_rows
+            if row.get("vlm_valid") == 1.0
+            and row.get("vlm_commitment_valid") == 1.0
+        ]
+        primary_by_sample = {row["sample_id"]: row for row in commitment_targets}
+        chain_incremental_drops = []
+        chain_incremental_flips = []
+        for chain in valid_chains:
+            primary = primary_by_sample.get(chain["sample_id"])
+            if primary is None:
+                continue
+            chain_incremental_drops.append(
+                chain["vlm_original_class_probability_drop"]
+                - primary["vlm_original_class_probability_drop"]
+            )
+            chain_incremental_flips.append(float(
+                chain.get("vlm_twin_prediction") != primary.get("vlm_twin_prediction")
+            ))
+
+        commitment = {
+            "n_valid_primary_commitments": len(commitment_targets),
+            "outcome_type_accuracy": group_rate(commitment_targets, "vlm_outcome_type_commitment_match"),
+            "expected_emotion_accuracy": group_rate(commitment_targets, "vlm_expected_emotion_match"),
+            "exact_commitment_accuracy": group_rate(commitment_targets, "vlm_counterfactual_commitment_kept"),
+            "role_outcome_declaration_coherence_rate": group_rate(
+                commitment_targets, "vlm_role_outcome_declaration_coherent"
+            ),
+            "outcome_emotion_declaration_coherence_rate": group_rate(
+                commitment_targets, "vlm_outcome_emotion_declaration_coherent"
+            ),
+            "full_declaration_coherence_rate": group_rate(
+                commitment_targets, "vlm_commitment_declaration_coherent"
+            ),
+            "cue_substitution_rate": group_rate(commitment_targets, "vlm_cue_substitution"),
+            "declared_backup_activation_rate_given_substitution": (
+                group_rate(substitutions_with_backup, "vlm_declared_backup_cue_activated")
+                if substitutions_with_backup else float("nan")
+            ),
+            "post_edit_rerationalization_rate": group_rate(
+                commitment_targets, "vlm_post_edit_rerationalization"
+            ),
+            "forecast_consistent_stability_rate": group_rate(
+                commitment_targets, "vlm_forecast_consistent_stability"
+            ),
+            "by_declared_role": by_role,
+            "n_declared_backup_targets": len(backup_targets),
+            "declared_backup_target_flip_rate": (
+                group_rate(backup_targets, "vlm_original_prediction_flip")
+                if backup_targets else float("nan")
+            ),
+            "declared_backup_target_class_drop_mean": (
+                float(np.mean([row["vlm_original_class_probability_drop"] for row in backup_targets]))
+                if backup_targets else float("nan")
+            ),
+            "n_primary_plus_backup_chains": len(valid_chains),
+            "primary_plus_backup_chain_flip_rate": (
+                group_rate(valid_chains, "vlm_original_prediction_flip")
+                if valid_chains else float("nan")
+            ),
+            "primary_plus_backup_chain_class_drop_mean": (
+                float(np.mean([row["vlm_original_class_probability_drop"] for row in valid_chains]))
+                if valid_chains else float("nan")
+            ),
+            "chain_incremental_class_drop_over_primary_mean": (
+                float(np.mean(chain_incremental_drops))
+                if chain_incremental_drops else float("nan")
+            ),
+            "chain_changes_post_primary_label_rate": (
+                float(np.mean(chain_incremental_flips))
+                if chain_incremental_flips else float("nan")
+            ),
+            "probability_note": "VLM confidence levels are mapped to ordinal probability proxies; categorical forecasts and label changes are the primary endpoints.",
+        }
+        if "essential" in by_role and "incidental" in by_role:
+            commitment["essential_minus_incidental_flip_rate"] = (
+                by_role["essential"]["prediction_flip_rate"]
+                - by_role["incidental"]["prediction_flip_rate"]
+            )
+        result["counterfactual_cue_commitments"] = commitment
     return result
