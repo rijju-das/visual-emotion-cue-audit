@@ -71,7 +71,7 @@ The models run sequentially to reduce GPU-memory pressure. Their comparison is w
 - `twins/commitment_chain/`: primary-plus-declared-backup twins.
 - `contact_sheet.png`, `report.md`, and `human_validation_template.csv`: qualitative review and validation material.
 
-The older `emotion6_abaw80_exact_*` configurations and downloaded `runs/emotion6_abaw80_exact_*` directories are retained only for provenance. They predate prospective cue-role, outcome, and backup commitments and cannot be used as results for the new claim.
+All pre-commitment results are isolated under `runs/baseline/`, including the two `emotion6_abaw80_exact_*` runs and their comparison. They are retained only for provenance and baseline analysis. They predate prospective cue-role, outcome, and backup commitments and cannot be used as results for the new claim. New commitment runs are written directly under `runs/` with the `emotion6_abaw80_commitment_*` prefix.
 
 ## Primary endpoints
 

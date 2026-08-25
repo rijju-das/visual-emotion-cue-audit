@@ -7,7 +7,7 @@
     "audit_manifest": "data/audit80/manifest.jsonl"
   },
   "run": {
-    "output_dir": "runs/emotion6_abaw80_exact_smolvlm500m_server",
+    "output_dir": "runs/baseline/emotion6_abaw80_exact_smolvlm500m_server",
     "limit_per_class": 10,
     "enabled_cues": ["color_lighting", "facial_action_region", "scene_context"],
     "text_conflict": false,
@@ -38,7 +38,7 @@
     "enable_vlm": true,
     "vlm_local_files_only": false,
     "vlm_pair_limit_per_cue": 0,
-    "vlm_cache_dir": "runs/emotion6_abaw80_exact_smolvlm500m_server/vlm_cache"
+    "vlm_cache_dir": "runs/baseline/emotion6_abaw80_exact_smolvlm500m_server/vlm_cache"
   },
   "assets": {
     "face_landmarker": "assets/mediapipe/face_landmarker.task",
