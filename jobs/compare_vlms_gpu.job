@@ -25,10 +25,10 @@ python -m pip install -e '.[face,vlm]' || exit 1
 affective-twins doctor --config configs/emotion6_abaw80_exact_smolvlm500m_server.json
 affective-twins all --config configs/emotion6_abaw80_exact_smolvlm500m_server.json || exit 1
 
-affective-twins doctor --config configs/emotion6_abaw80_exact_qwen3vl4b_server.json
-affective-twins all --config configs/emotion6_abaw80_exact_qwen3vl4b_server.json || exit 1
+affective-twins doctor --config configs/emotion6_abaw80_exact_qwen25vl3b_server.json
+affective-twins all --config configs/emotion6_abaw80_exact_qwen25vl3b_server.json || exit 1
 
 python scripts/compare_vlm_runs.py \
   --run smolvlm500m=runs/emotion6_abaw80_exact_smolvlm500m_server \
-  --run qwen3vl4b=runs/emotion6_abaw80_exact_qwen3vl4b_server \
+  --run qwen25vl3b=runs/emotion6_abaw80_exact_qwen25vl3b_server \
   --output-dir runs/vlm_exact_grounding_comparison

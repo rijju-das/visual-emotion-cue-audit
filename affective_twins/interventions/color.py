@@ -33,6 +33,7 @@ class ColorIntervention:
         semantic_model: str = "nvidia/segformer-b0-finetuned-ade-512-512",
         semantic_score_threshold: float = 0.45,
         semantic_local_files_only: bool = False,
+        segmentation_device: str = "auto",
         semantic_provider: Optional[Callable[[Image.Image], List[Dict]]] = None,
         mask_provider: Optional[Callable[[Image.Image], List[Dict]]] = None,
     ):
@@ -54,6 +55,7 @@ class ColorIntervention:
         self.semantic_model_name = semantic_model
         self.semantic_score_threshold = semantic_score_threshold
         self.semantic_local_files_only = semantic_local_files_only
+        self.segmentation_device = segmentation_device
         self.semantic_provider = semantic_provider
         self.mask_provider = mask_provider
         self._model = None
@@ -80,7 +82,10 @@ class ColorIntervention:
             import torch
             from transformers import AutoImageProcessor, Mask2FormerForUniversalSegmentation
 
-            self._panoptic_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            requested = self.segmentation_device
+            self._panoptic_device = torch.device(
+                "cuda" if requested == "auto" and torch.cuda.is_available() else "cpu" if requested == "auto" else requested
+            )
             self._panoptic_processor = AutoImageProcessor.from_pretrained(
                 self.panoptic_model_name,
                 local_files_only=self.panoptic_local_files_only,
@@ -195,7 +200,10 @@ class ColorIntervention:
             import torch
             from transformers import AutoImageProcessor, AutoModelForSemanticSegmentation
 
-            self._semantic_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            requested = self.segmentation_device
+            self._semantic_device = torch.device(
+                "cuda" if requested == "auto" and torch.cuda.is_available() else "cpu" if requested == "auto" else requested
+            )
             self._semantic_processor = AutoImageProcessor.from_pretrained(
                 self.semantic_model_name,
                 local_files_only=self.semantic_local_files_only,

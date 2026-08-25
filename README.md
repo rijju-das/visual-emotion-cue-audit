@@ -37,9 +37,9 @@ export XDG_CACHE_HOME="$PWD/.cache"
 .venv/bin/affective-twins report
 ```
 
-Use `.venv/bin/affective-twins all --config configs/emotion6_abaw80_exact_qwen3vl4b_server.json` after a checkpoint exists to run the stronger Qwen3-VL-4B report-conditioned audit. The GPU workflow is available in `jobs/full_vlm_gpu.job`.
+Use `.venv/bin/affective-twins all --config configs/emotion6_abaw80_exact_qwen25vl3b_server.json` after a checkpoint exists to run the stronger, lower-memory Qwen2.5-VL-3B report-conditioned audit. The GPU workflow is available in `jobs/full_vlm_gpu.job`.
 
-The exact-grounding configurations are `configs/emotion6_abaw80_exact_qwen3vl4b_server.json` and `configs/emotion6_abaw80_exact_smolvlm500m_server.json`. Their outputs are isolated in `runs/emotion6_abaw80_exact_qwen3vl4b_server/` and `runs/emotion6_abaw80_exact_smolvlm500m_server/`, leaving every earlier run untouched. Mask2Former and SegFormer propose complete objects and background surfaces. A colour report must name one of those entities; a face report must say brows, eyes, or mouth; and a context report targets the subject-preserving full background. Embedded text is neither offered to the VLM nor generated as an intervention in these configurations. A failed or order-sensitive grounding is recorded as ineligible rather than replaced by a locator-selected target.
+The exact-grounding configurations are `configs/emotion6_abaw80_exact_qwen25vl3b_server.json` and `configs/emotion6_abaw80_exact_smolvlm500m_server.json`. Their outputs are isolated in `runs/emotion6_abaw80_exact_qwen25vl3b_server/` and `runs/emotion6_abaw80_exact_smolvlm500m_server/`, leaving every earlier run untouched. Mask2Former and SegFormer propose complete objects and background surfaces. In the server configurations, these segmenters run on CPU while the VLM uses automatic GPU placement, avoiding simultaneous GPU residency. A colour report must name one of those entities; a face report must say brows, eyes, or mouth; and a context report targets the subject-preserving full background. Embedded text is neither offered to the VLM nor generated as an intervention in these configurations. A failed or order-sensitive grounding is recorded as ineligible rather than replaced by a locator-selected target.
 
 To compare the stronger VLM with the compact baseline on the server, submit:
 
@@ -95,7 +95,7 @@ The matched-control analysis supports selective colour sensitivity: the mean tar
 
 ## VLM status
 
-The VLM adapter implements constrained reporting of discrete emotion, valence--arousal, confidence, cue identification, cue-specific visible evidence, and a literal caption. The primary model is `Qwen/Qwen3-VL-4B-Instruct`; `HuggingFaceTB/SmolVLM-500M-Instruct` is retained as a compact baseline. Invalid outputs and evidence that cannot be grounded exactly are retained as audit failures rather than silently repaired. The earlier 500M result below predates exact evidence grounding and should not be used as the final claim: it evaluated 201 target pairs, obtained 188 valid constrained outputs (93.5%), cue-family grounding accuracy of 35.1% (95% CI [28.7%, 42.0%]), and caption Jaccard similarity of 0.416.
+The VLM adapter implements constrained reporting of discrete emotion, valence--arousal, confidence, cue identification, cue-specific visible evidence, and a literal caption. The primary model is `Qwen/Qwen2.5-VL-3B-Instruct`; `HuggingFaceTB/SmolVLM-500M-Instruct` is retained as a compact baseline. Invalid outputs and evidence that cannot be grounded exactly are retained as audit failures rather than silently repaired. The earlier 500M result below predates exact evidence grounding and should not be used as the final claim: it evaluated 201 target pairs, obtained 188 valid constrained outputs (93.5%), cue-family grounding accuracy of 35.1% (95% CI [28.7%, 42.0%]), and caption Jaccard similarity of 0.416.
 
 ## Interpretation boundary
 

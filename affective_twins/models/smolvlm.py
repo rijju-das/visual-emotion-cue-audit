@@ -93,11 +93,17 @@ class SmolVLMAdapter:
         self.model = None
         for model_class in model_classes:
             try:
+                load_kwargs = {
+                    "dtype": dtype,
+                    "local_files_only": local_files_only,
+                    "trust_remote_code": False,
+                    "low_cpu_mem_usage": True,
+                }
+                if torch.cuda.is_available():
+                    load_kwargs["device_map"] = "auto"
                 self.model = model_class.from_pretrained(
                     model_name,
-                    dtype=dtype,
-                    local_files_only=local_files_only,
-                    trust_remote_code=False,
+                    **load_kwargs,
                 )
                 break
             except (TypeError, ValueError, KeyError) as error:
@@ -110,10 +116,11 @@ class SmolVLMAdapter:
                 )
             )
         if torch.cuda.is_available():
-            self.device = torch.device("cuda")
+            self.device = next(self.model.parameters()).device
         else:
             self.device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-        self.model.to(self.device).eval()
+            self.model.to(self.device)
+        self.model.eval()
 
     @staticmethod
     def _choice(text: str, choices: Sequence[str]) -> Optional[str]:

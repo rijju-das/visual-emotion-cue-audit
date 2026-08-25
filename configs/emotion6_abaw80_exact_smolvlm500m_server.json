@@ -13,6 +13,7 @@
     "text_conflict": false,
     "save_all_candidates": false,
     "color_backend": "maskrcnn",
+    "segmentation_device": "cpu",
     "object_score_threshold": 0.65,
     "object_mask_threshold": 0.5,
     "object_min_area_fraction": 0.01,

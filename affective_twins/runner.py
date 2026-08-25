@@ -510,6 +510,7 @@ def generate(config: Dict) -> Dict:
             ),
             semantic_score_threshold=float(config["run"].get("semantic_score_threshold", 0.45)),
             semantic_local_files_only=bool(config["model"].get("semantic_local_files_only", False)),
+            segmentation_device=config["run"].get("segmentation_device", "auto"),
         ),
         FaceActionRegionIntervention(
             config["assets"]["face_landmarker"],

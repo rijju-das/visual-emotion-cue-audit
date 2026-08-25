@@ -7,12 +7,13 @@
     "audit_manifest": "data/audit80/manifest.jsonl"
   },
   "run": {
-    "output_dir": "runs/emotion6_abaw80_exact_qwen3vl4b_server",
+    "output_dir": "runs/emotion6_abaw80_exact_qwen25vl3b_server",
     "limit_per_class": 10,
     "enabled_cues": ["color_lighting", "facial_action_region", "scene_context"],
     "text_conflict": false,
     "save_all_candidates": false,
     "color_backend": "maskrcnn",
+    "segmentation_device": "cpu",
     "object_score_threshold": 0.65,
     "object_mask_threshold": 0.5,
     "object_min_area_fraction": 0.01,
@@ -33,11 +34,11 @@
     "panoptic_local_files_only": false,
     "semantic_model": "nvidia/segformer-b0-finetuned-ade-512-512",
     "semantic_local_files_only": false,
-    "vlm_model": "Qwen/Qwen3-VL-4B-Instruct",
+    "vlm_model": "Qwen/Qwen2.5-VL-3B-Instruct",
     "enable_vlm": true,
     "vlm_local_files_only": false,
     "vlm_pair_limit_per_cue": 0,
-    "vlm_cache_dir": "runs/emotion6_abaw80_exact_qwen3vl4b_server/vlm_cache"
+    "vlm_cache_dir": "runs/emotion6_abaw80_exact_qwen25vl3b_server/vlm_cache"
   },
   "assets": {
     "face_landmarker": "assets/mediapipe/face_landmarker.task",
